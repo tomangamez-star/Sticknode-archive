@@ -1,0 +1,45 @@
+STICK NODES ARCHIVE — GITHUB ACTIONS SETUP
+==========================================
+
+1) Push this complete project to a GitHub repository.
+
+2) Open:
+   Repository → Settings → Secrets and variables → Actions
+
+3) Add these Repository secrets:
+
+   REQUIRED
+   --------
+   TELEGRAM_TOKEN
+   DATABASE_URL
+   ARCHIVE_CHAT_ID
+
+   OPTIONAL
+   --------
+   OWNER_ID
+   INGEST_NOTIFICATION_CHAT_ID
+
+   INGEST_NOTIFICATION_CHAT_ID can be your private Telegram user/chat/group ID.
+   The bot must already be able to message that destination.
+
+4) Go to:
+   Repository → Actions → Stick Nodes archive ingest → Run workflow
+
+5) First historical run recommendation:
+
+   mode: backfill
+   backfill_pages: 25
+   recent_pages: 3   (ignored in backfill mode)
+   retry_failures: true
+   start_page: 0
+
+6) Run it again later with start_page still at 0.
+   Postgres remembers the next historical page automatically.
+
+IMPORTANT
+---------
+- Do not paste secrets into the repository files.
+- GitHub Secrets and Render environment variables are separate. Add the same
+  TELEGRAM_TOKEN / DATABASE_URL / ARCHIVE_CHAT_ID to each platform.
+- Render now handles recent-page syncing only. GitHub Actions handles the heavy backfill.
+- The Postgres advisory lock prevents both workers from ingesting at the same time.

@@ -1,0 +1,48 @@
+# Stick Nodes Telegram Archive — Render Blueprint
+# Push this repo to GitHub → Render → New → Blueprint → select the repo.
+# All credentials remain Render secrets; nothing sensitive is committed.
+services:
+  - type: web
+    name: sticknodes-archive-bot
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: TELEGRAM_TOKEN
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: ARCHIVE_CHAT_ID
+        sync: false
+      - key: OWNER_ID
+        sync: false
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: "10000"
+      - key: WEB_CONCURRENCY
+        value: "1"
+      - key: STICKNODES_BASE_URL
+        value: https://sticknodes.com
+      - key: STICKNODES_LIST_URL
+        value: https://sticknodes.com/stickfigures/
+      - key: SCRAPER_AUTO_RUN
+        value: "true"
+      - key: SCRAPER_INTERVAL_MINUTES
+        value: "10"
+      - key: SCRAPER_BACKFILL_PAGES_PER_CYCLE
+        value: "0"
+      - key: SCRAPER_RECENT_PAGES
+        value: "3"
+      - key: SCRAPER_SITE_DELAY_MS
+        value: "350"
+      - key: SCRAPER_UPLOAD_DELAY_MS
+        value: "1100"
+      - key: SCRAPER_MAX_FILE_MB
+        value: "45"
+      - key: SCRAPER_FETCH_DETAILS
+        value: "true"
+      - key: ARCHIVE_PAGE_SIZE
+        value: "20"

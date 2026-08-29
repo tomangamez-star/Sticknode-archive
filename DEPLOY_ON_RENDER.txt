@@ -1,0 +1,30 @@
+STICK NODES ARCHIVE BOT — QUICK DEPLOY
+
+1. Create a PRIVATE Telegram group/channel for archived files.
+2. Add your bot. If using a channel, make the bot an admin able to post documents.
+3. Push this project to GitHub.
+4. Render -> New -> Blueprint -> select the GitHub repo.
+5. Render will read render.yaml.
+6. Enter these secrets when Render asks:
+   TELEGRAM_TOKEN   = your Telegram bot token
+   DATABASE_URL     = your Supabase/Postgres connection URL
+   ARCHIVE_CHAT_ID  = private archive group/channel ID (often -100...)
+   OWNER_ID         = your Telegram user ID
+7. Deploy.
+
+FIRST BOOT
+- Tables and indexes are created automatically.
+- Telegram bot starts long polling.
+- Health endpoint: /health
+- Automatic scraper starts after boot.
+- It repeatedly checks recent pages and also continues the historical backfill.
+
+BOT COMMANDS
+/start or /archive   Open file browser
+/search <query>      Search names/tags/creators
+/stats               Archive totals
+/status              Owner scraper status
+/sync [pages]        Owner manual scraper batch
+
+DEFAULT BROWSER PAGE SIZE: 20 files.
+Change ARCHIVE_PAGE_SIZE in Render if desired (10-30).
