@@ -1,0 +1,11 @@
+'use strict';
+const assert = require('assert');
+const ui = require('../src/ui');
+const root = ui.rootMenu();
+assert(root.text.includes('STICK NODES ARCHIVE'));
+assert(root.keyboard.inline_keyboard.flat().some((b) => b.callback_data === 'at:n'));
+const categories = ui.categoryMenu('node');
+assert(categories.keyboard.inline_keyboard.flat().some((b) => b.callback_data === 'ac:n:we'));
+const letters = ui.letterMenu('movieclip', 'people');
+assert(letters.keyboard.inline_keyboard.flat().some((b) => b.callback_data === 'al:m:pe:a:1'));
+console.log('ui.test.js OK');
