@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: What should Render ingest?
+        description: What should GitHub ingest?
         required: true
         default: backfill
         type: choice
@@ -15,15 +15,10 @@ on:
         default: '25'
         type: string
       recent_pages:
-        description: Newest pages to re-check (recent/both)
+        description: Newest pages to re-check
         required: true
         default: '3'
         type: string
-      retry_failures:
-        description: Retry previously failed files first
-        required: true
-        default: true
-        type: boolean
       start_page:
         description: Optional backfill cursor override (0 = resume)
         required: true
@@ -34,35 +29,38 @@ permissions:
   contents: read
 
 concurrency:
-  group: sticknodes-render-ingest
+  group: sticknodes-python-ingest
   cancel-in-progress: false
 
 jobs:
-  trigger-render:
+  ingest:
     runs-on: ubuntu-latest
     timeout-minutes: 350
     env:
-      RENDER_INGEST_URL: ${{ secrets.RENDER_INGEST_URL }}
-      RENDER_INGEST_SECRET: ${{ secrets.RENDER_INGEST_SECRET }}
+      TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      ARCHIVE_CHAT_ID: ${{ secrets.ARCHIVE_CHAT_ID }}
+      STICKNODES_BASE_URL: https://sticknodes.com
+      STICKNODES_LIST_URL: https://sticknodes.com/stickfigures/
+      SCRAPER_SITE_DELAY_MS: '350'
+      SCRAPER_UPLOAD_DELAY_MS: '1100'
+      SCRAPER_MAX_FILE_MB: '45'
+      SCRAPER_FETCH_DETAILS: 'true'
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          node-version: '22'
-
-      - name: Static checks
-        run: npm run check
-
-      - name: Trigger Render ingestion and follow progress
+          python-version: '3.12'
+          cache: pip
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+      - name: Run Python ingestion
         run: >-
-          node src/remote-trigger.js
+          python python_ingest/ingest.py
           --mode=${{ inputs.mode }}
           --backfill-pages=${{ inputs.backfill_pages }}
           --recent-pages=${{ inputs.recent_pages }}
-          --retry-failures=${{ inputs.retry_failures }}
-          --retry-limit=20
           --start-page=${{ inputs.start_page }}
