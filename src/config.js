@@ -18,6 +18,8 @@ module.exports = {
   databaseUrl: String(process.env.DATABASE_URL || '').trim(),
   archiveChatId: String(process.env.ARCHIVE_CHAT_ID || '').trim(),
   ownerId: String(process.env.OWNER_ID || '').trim(),
+  ingestApiSecret: String(process.env.INGEST_API_SECRET || '').trim(),
+  ingestNotificationChatId: String(process.env.INGEST_NOTIFICATION_CHAT_ID || '').trim(),
   port: int('PORT', 10000, 1, 65535),
   baseUrl: cleanBase(process.env.STICKNODES_BASE_URL || 'https://sticknodes.com'),
   listUrl: String(process.env.STICKNODES_LIST_URL || 'https://sticknodes.com/stickfigures/').trim(),
