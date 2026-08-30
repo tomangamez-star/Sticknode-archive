@@ -4,31 +4,28 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: What should this run ingest?
+        description: What should Render ingest?
         required: true
         default: backfill
         type: choice
-        options:
-          - backfill
-          - recent
-          - both
+        options: [backfill, recent, both]
       backfill_pages:
         description: Historical pages to process this run
         required: true
         default: '25'
         type: string
       recent_pages:
-        description: Newest pages to re-check (used by recent/both)
+        description: Newest pages to re-check (recent/both)
         required: true
         default: '3'
         type: string
       retry_failures:
-        description: Retry previously failed downloads first
+        description: Retry previously failed files first
         required: true
         default: true
         type: boolean
       start_page:
-        description: Optional backfill cursor override (0 = resume saved cursor)
+        description: Optional backfill cursor override (0 = resume)
         required: true
         default: '0'
         type: string
@@ -37,25 +34,16 @@ permissions:
   contents: read
 
 concurrency:
-  group: sticknodes-archive-ingest
+  group: sticknodes-render-ingest
   cancel-in-progress: false
 
 jobs:
-  ingest:
+  trigger-render:
     runs-on: ubuntu-latest
-    timeout-minutes: 330
+    timeout-minutes: 350
     env:
-      TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-      DATABASE_URL: ${{ secrets.DATABASE_URL }}
-      ARCHIVE_CHAT_ID: ${{ secrets.ARCHIVE_CHAT_ID }}
-      OWNER_ID: ${{ secrets.OWNER_ID }}
-      INGEST_NOTIFICATION_CHAT_ID: ${{ secrets.INGEST_NOTIFICATION_CHAT_ID }}
-      STICKNODES_BASE_URL: https://sticknodes.com
-      STICKNODES_LIST_URL: https://sticknodes.com/stickfigures/
-      SCRAPER_SITE_DELAY_MS: '350'
-      SCRAPER_UPLOAD_DELAY_MS: '1100'
-      SCRAPER_MAX_FILE_MB: '45'
-      SCRAPER_FETCH_DETAILS: 'true'
+      RENDER_INGEST_URL: ${{ secrets.RENDER_INGEST_URL }}
+      RENDER_INGEST_SECRET: ${{ secrets.RENDER_INGEST_SECRET }}
 
     steps:
       - name: Checkout repository
@@ -66,22 +54,15 @@ jobs:
         with:
           node-version: '22'
 
-      - name: Install dependencies
-        run: npm install
-
       - name: Static checks
         run: npm run check
 
-      - name: Tests
-        run: npm test
-
-      - name: Run archive ingestion
+      - name: Trigger Render ingestion and follow progress
         run: >-
-          node src/ingest.js
+          node src/remote-trigger.js
           --mode=${{ inputs.mode }}
           --backfill-pages=${{ inputs.backfill_pages }}
           --recent-pages=${{ inputs.recent_pages }}
           --retry-failures=${{ inputs.retry_failures }}
           --retry-limit=20
           --start-page=${{ inputs.start_page }}
-          --lock-wait-seconds=300
