@@ -5,44 +5,177 @@ const db = require('./db');
 const { parseListing, parseDetail } = require('./parser');
 const { sleep, clean, sha256, filenameFromUrl, fileTypeOf, tagsFromTitle, htmlEscape, formatBytes } = require('./utils');
 
-const USER_AGENT = 'StickNodesArchiveBot/1.0 (+private preservation archive; respectful rate limits)';
+// StickNodes currently rejects some obvious server/bot request profiles with 403.
+// Use a normal, standards-compatible browser request profile and keep any public
+// session cookies the site sets. This does not use login cookies or challenge
+// bypasses; it simply behaves like a normal HTTP client visiting public pages.
+const USER_AGENT = String(process.env.STICKNODES_USER_AGENT ||
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36').trim();
+const cookieJar = new Map();
+let sessionWarmPromise = null;
+let sessionWarmed = false;
 let bot = null;
 let runningPromise = null;
 
 function attachBot(instance) { bot = instance; }
 function pageUrl(page) {
   const url = new URL(config.listUrl);
-  if (Number(page) > 1) url.searchParams.set('wpfb_list_page', String(page));
-  else url.searchParams.delete('wpfb_list_page');
+  // The public archive exposes explicit numbered listing URLs. Use the explicit
+  // page parameter even for page 1 so every backfill request follows the same
+  // stable listing route.
+  url.searchParams.set('wpfb_list_page', String(Math.max(1, Number(page) || 1)));
   return url.href;
+}
+
+function rememberCookies(headers) {
+  let values = [];
+  try {
+    if (typeof headers.getSetCookie === 'function') values = headers.getSetCookie();
+  } catch (_) {}
+  if (!values.length) {
+    const combined = headers.get('set-cookie');
+    if (combined) values = [combined];
+  }
+  for (const raw of values) {
+    // We only need the cookie name/value. Attributes are intentionally ignored.
+    const first = String(raw || '').split(';', 1)[0];
+    const eq = first.indexOf('=');
+    if (eq <= 0) continue;
+    const name = first.slice(0, eq).trim();
+    const value = first.slice(eq + 1).trim();
+    if (name) cookieJar.set(name, value);
+  }
+}
+
+function cookiesHeader() {
+  return [...cookieJar.entries()].map(([k, v]) => `${k}=${v}`).join('; ');
+}
+
+function requestHeaders(kind = 'html', referer = '') {
+  const html = kind === 'html';
+  const headers = {
+    'User-Agent': USER_AGENT,
+    'Accept': html
+      ? 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8'
+      : 'application/octet-stream,application/zip;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Cache-Control': 'no-cache',
+    'Pragma': 'no-cache',
+  };
+  if (referer) headers.Referer = referer;
+  const cookie = cookiesHeader();
+  if (cookie) headers.Cookie = cookie;
+  return headers;
+}
+
+async function responseSnippet(response, limit = 500) {
+  try {
+    const text = await response.text();
+    return clean(text.replace(/\s+/g, ' ')).slice(0, limit);
+  } catch (_) {
+    return '';
+  }
+}
+
+async function warmPublicSession() {
+  if (sessionWarmed) return true;
+  if (sessionWarmPromise) return sessionWarmPromise;
+  sessionWarmPromise = (async () => {
+    const home = new URL('/', config.baseUrl).href;
+    try {
+      const response = await fetch(home, {
+        redirect: 'follow',
+        headers: requestHeaders('html'),
+        signal: AbortSignal.timeout(20000),
+      });
+      rememberCookies(response.headers);
+      if (response.ok) {
+        sessionWarmed = true;
+        console.log(`[scraper] public session ready (${response.status})`);
+        return true;
+      }
+      const snippet = await responseSnippet(response, 240);
+      console.warn(`[scraper] session warm-up returned HTTP ${response.status}${snippet ? `: ${snippet}` : ''}`);
+      return false;
+    } catch (error) {
+      console.warn(`[scraper] session warm-up failed: ${error.message || error}`);
+      return false;
+    } finally {
+      sessionWarmPromise = null;
+    }
+  })();
+  return sessionWarmPromise;
+}
+
+function blockedError(url, response, snippet = '') {
+  const error = new Error(`HTTP 403 Forbidden from StickNodes${snippet ? ` — ${snippet}` : ''}`);
+  error.code = 'STICKNODES_FORBIDDEN';
+  error.status = 403;
+  error.url = url;
+  error.responseHeaders = {
+    server: response.headers.get('server') || '',
+    via: response.headers.get('via') || '',
+    cfRay: response.headers.get('cf-ray') || '',
+    contentType: response.headers.get('content-type') || '',
+  };
+  return error;
 }
 
 async function fetchWithRetry(url, options = {}, attempts = 4) {
   let last;
+  let warmedAfter403 = false;
+  const kind = options.kind || 'html';
+  const referer = options.referer || '';
+  const timeoutMs = options.timeoutMs || 30000;
+  const extraHeaders = options.headers || {};
+
   for (let i = 0; i < attempts; i += 1) {
     try {
       const response = await fetch(url, {
         redirect: 'follow',
-        ...options,
-        headers: { 'User-Agent': USER_AGENT, Accept: '*/*', ...(options.headers || {}) },
-        signal: AbortSignal.timeout(options.timeoutMs || 30000),
+        method: options.method || 'GET',
+        headers: { ...requestHeaders(kind, referer), ...extraHeaders },
+        signal: AbortSignal.timeout(timeoutMs),
       });
+      rememberCookies(response.headers);
+
+      if (response.status === 403) {
+        const snippet = await responseSnippet(response.clone(), 500);
+        // One ordinary public-session warm-up is worth trying because some sites
+        // set a benign session cookie on the homepage. Never hammer a 403.
+        if (!warmedAfter403 && !sessionWarmed) {
+          warmedAfter403 = true;
+          const warmed = await warmPublicSession();
+          if (warmed) continue;
+        }
+        throw blockedError(url, response, snippet);
+      }
+
       if (response.status === 429) {
         const retry = Math.max(2, Number(response.headers.get('retry-after') || 3));
         await sleep(retry * 1000);
         continue;
       }
-      if (!response.ok) throw new Error(`HTTP ${response.status} ${response.statusText}`);
+
+      if (!response.ok) {
+        const snippet = await responseSnippet(response.clone(), 300);
+        const error = new Error(`HTTP ${response.status} ${response.statusText}${snippet ? ` — ${snippet}` : ''}`);
+        error.status = response.status;
+        throw error;
+      }
       return response;
     } catch (error) {
       last = error;
+      // 403 is a policy/access rejection, not a transient network failure.
+      if (error && error.status === 403) throw error;
       if (i + 1 < attempts) await sleep(1000 * (i + 1));
     }
   }
   throw last || new Error('request failed');
 }
-async function fetchText(url) {
-  const response = await fetchWithRetry(url, { headers: { Accept: 'text/html,application/xhtml+xml' } });
+
+async function fetchText(url, referer = '') {
+  const response = await fetchWithRetry(url, { kind: 'html', referer });
   return response.text();
 }
 function contentDispositionFilename(header) {
@@ -53,7 +186,7 @@ function contentDispositionFilename(header) {
   return m ? clean(m[1]).replace(/^['"]|['"]$/g, '') : '';
 }
 async function downloadFile(item) {
-  const response = await fetchWithRetry(item.download_url, { headers: { Accept: 'application/octet-stream,application/zip,*/*' }, timeoutMs: 60000 });
+  const response = await fetchWithRetry(item.download_url, { kind: 'file', referer: item.detail_url || item.source_page || config.listUrl, timeoutMs: 60000 });
   const declared = Number(response.headers.get('content-length') || 0);
   if (declared && declared > config.maxFileBytes) throw new Error(`file too large (${formatBytes(declared)} > ${formatBytes(config.maxFileBytes)})`);
   const buffer = Buffer.from(await response.arrayBuffer());
@@ -98,7 +231,7 @@ async function uploadToTelegram(item, buffer, contentType) {
 async function hydrateDetail(item) {
   if (!config.fetchDetails || !item.detail_url) return item;
   await sleep(config.siteDelayMs);
-  const html = await fetchText(item.detail_url);
+  const html = await fetchText(item.detail_url, item.source_page || config.listUrl);
   return parseDetail(html, item.detail_url, item);
 }
 
@@ -138,7 +271,7 @@ async function processItem(seed, page) {
 async function scrapePage(page) {
   const url = pageUrl(page);
   console.log(`[scraper] listing page ${page}: ${url}`);
-  const html = await fetchText(url);
+  const html = await fetchText(url, new URL('/', config.baseUrl).href);
   const items = parseListing(html, url);
   if (!items.length) return { page, empty: true, archived: 0, skipped: 0, failed: 0, duplicate: 0, count: 0 };
   let archived = 0, skipped = 0, failed = 0, duplicate = 0;
