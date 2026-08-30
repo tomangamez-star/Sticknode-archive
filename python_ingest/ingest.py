@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
-import argparse, hashlib, html, os, re, time
+import argparse, hashlib, html, os, re, sys, time
+from pathlib import Path
 from datetime import datetime, timezone
 from urllib.parse import urljoin, urlparse, unquote
 from bs4 import BeautifulSoup
-# from curl_cffi import requests   # <--- REMOVE THIS LINE
+from curl_cffi import requests as http_requests
 import psycopg
 from psycopg.rows import dict_row
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from python_retriever.retriever import Retriever, RetrieverError
 
 BASE=os.getenv('STICKNODES_BASE_URL','https://sticknodes.com').rstrip('/')
 LIST=os.getenv('STICKNODES_LIST_URL','https://sticknodes.com/stickfigures/').strip()
@@ -16,7 +22,6 @@ FETCH_DETAILS=os.getenv('SCRAPER_FETCH_DETAILS','true').lower() in ('1','true','
 
 # Browser setup for GitHub Actions / CI
 import undetected_chromedriver as uc
-import sys
 
 class CustomSession:
     def __init__(self):
@@ -40,7 +45,16 @@ class CustomSession:
         if hasattr(self, "_driver"):
             self._driver.quit()
 
-s = CustomSession()
+_chrome_session = None
+
+def chrome_session():
+    global _chrome_session
+    if _chrome_session is None:
+        _chrome_session = CustomSession()
+    return _chrome_session
+
+INGEST_FETCH_PROVIDER = os.getenv("INGEST_FETCH_PROVIDER", "retriever").strip().lower()
+web_retriever = Retriever() if INGEST_FETCH_PROVIDER == "retriever" else None
 
 UA=os.getenv('STICKNODES_USER_AGENT','Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/139.0.0.0 Safari/537.36')
 CATS=['Backgrounds','Effects','Miscellaneous','Objects','Packs','People','Weapons','Vehicles']
@@ -56,14 +70,13 @@ def norm(x): return clean(x).lower()
 def tags(title,cat,typ): return list(dict.fromkeys(re.findall(r'[a-z0-9]+',norm(title))+[cat,typ]))
 def page_url(n): return LIST + ('&' if '?' in LIST else '?') + f'wpfb_list_page={max(1,n)}'
 
-def get(url, timeout=45):
+def chrome_get(url, timeout=45):
+    s = chrome_session()
     last=None
     for i in range(4):
         try:
-            # Execute network enable to handle redirects properly via CDP if needed
-            s._driver.execute_cdp_cmd("Network.enable", {}) 
-            
-            r = s._driver.get(url) # Navigate using Selenium; timeout is set via set_page_load_timeout()
+            s._driver.execute_cdp_cmd("Network.enable", {})
+            s._driver.get(url)
 
             print("[debug] PAGE TITLE:", s._driver.title)
             print("[debug] CURRENT URL:", s._driver.current_url)
@@ -71,34 +84,40 @@ def get(url, timeout=45):
             print("[debug] PAGE PREVIEW:", s._driver.page_source[:500].replace("\n", " "))
 
             time.sleep(max(0.1, float(os.getenv('SCRAPER_SITE_DELAY_MS','350'))/1000))
-            
-            status_code = s._driver.current_url  # Check redirect loop or final URL logic here if complex
             text_content = s._driver.page_source
-                
-            # Simulate a simple response object for compatibility with existing code (mostly text-based parsing)
-            class FakeResponse:
-                def __init__(self, text): self.text = self.html_text = text 
-                @property 
-                def content(self): return self.text.encode()
-                
-                def raise_for_status(self): 
-                    try: int(s._driver.execute_cdp_cmd("Network.getResponseBody", {"requestId": r.id}).get("body", "")) 
-                    except: pass
-                    
-                status_code = 200
-                headers = {}
-            
-            if '429' in str(text_content) or s._driver.current_url.startswith('http://'): # Fallback check for retry-after logic if parsed from source
-                 time.sleep(max(2,int(re.search(r'try-after',text_content,flags=re.I).group(1))) if re.search(r'retry-after', text_content,re.I) else 3); continue
-            
-            return FakeResponse(text_content)
 
+            class BrowserResponse:
+                status_code = 200
+                headers = {"content-type": "text/html; charset=utf-8"}
+                def __init__(self, text): self.text = text
+                @property
+                def content(self): return self.text.encode("utf-8", errors="replace")
+                def raise_for_status(self): return None
+
+            return BrowserResponse(text_content)
         except Exception as e:
             last=e
-            # Basic error handling similar to curl_cffi but adapted for browser state
-            if i < 3 and 'NetworkError' not in str(e): 
+            if i < 3:
                 time.sleep(i+1)
-    raise last or RuntimeError(f"Browser session failed after retries")
+    raise last or RuntimeError("Browser session failed after retries")
+
+def get(url, timeout=45):
+    if INGEST_FETCH_PROVIDER == "chrome":
+        print(f"[fetch] provider=chrome url={url}")
+        return chrome_get(url, timeout)
+
+    if INGEST_FETCH_PROVIDER != "retriever":
+        raise RuntimeError("INGEST_FETCH_PROVIDER must be 'retriever' or 'chrome'")
+
+    print(f"[fetch] provider={web_retriever.provider} url={url}")
+    response = web_retriever.raw_fetch(url, timeout=timeout)
+    print(
+        f"[fetch] status={response.status_code} "
+        f"type={response.content_type or 'unknown'} bytes={len(response.content)} "
+        f"time={response.fetch_ms}ms"
+    )
+    return response
+
 def category_from(url):
     p=urlparse(url).path.lower()
     for c in CATS:
@@ -149,11 +168,14 @@ def process(c,it,p):
     if q(c,'SELECT id FROM stick_archive_files WHERE source_url=%s AND telegram_file_id IS NOT NULL LIMIT 1',(it['source_url'],)): return 'skipped'
     try:
         it=hydrate(it); time.sleep(DELAY); r=get(it['download_url'],60); data=r.content
+        content_type=str(r.headers.get('content-type','')).lower()
+        if 'text/html' in content_type or data[:128].lstrip().lower().startswith((b'<!doctype html', b'<html')):
+            raise RuntimeError('download URL returned HTML instead of the original asset bytes; refusing to archive it')
         if len(data)>MAX_BYTES: raise RuntimeError(f'file too large ({len(data)} bytes)')
         it['actual_size_bytes']=len(data); it['sha256']=hashlib.sha256(data).hexdigest()
         dup=q(c,'SELECT id FROM stick_archive_files WHERE sha256=%s AND telegram_file_id IS NOT NULL LIMIT 1',(it['sha256'],))
         if dup: q(c,'INSERT INTO stick_archive_aliases(source_url,file_id) VALUES(%s,%s) ON CONFLICT(source_url) DO UPDATE SET file_id=EXCLUDED.file_id',(it['source_url'],dup[0]['id'])); c.commit(); return 'duplicate'
-        tr=requests.post(f'https://api.telegram.org/bot{TOKEN}/sendDocument',data={'chat_id':CHAT,'caption':caption(it),'parse_mode':'HTML'},files={'document':(it['original_filename'],data,r.headers.get('content-type','application/octet-stream'))},timeout=90); tr.raise_for_status(); msg=tr.json()['result']; doc=msg['document']
+        tr=http_requests.post(f'https://api.telegram.org/bot{TOKEN}/sendDocument',data={'chat_id':CHAT,'caption':caption(it),'parse_mode':'HTML'},files={'document':(it['original_filename'],data,r.headers.get('content-type','application/octet-stream'))},timeout=90); tr.raise_for_status(); msg=tr.json()['result']; doc=msg['document']
         q(c,"""INSERT INTO stick_archive_files(source_url,detail_url,source_page,title,normalized_title,original_filename,file_type,category,categories,tags,tags_text,creator,creator_handle,description,source_date,source_hits,pack_count,declared_size_bytes,actual_size_bytes,sha256,telegram_file_id,telegram_file_unique_id,telegram_message_id,archive_chat_id,updated_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW()) ON CONFLICT(source_url) DO UPDATE SET title=EXCLUDED.title,normalized_title=EXCLUDED.normalized_title,original_filename=EXCLUDED.original_filename,file_type=EXCLUDED.file_type,category=EXCLUDED.category,categories=EXCLUDED.categories,tags=EXCLUDED.tags,tags_text=EXCLUDED.tags_text,actual_size_bytes=EXCLUDED.actual_size_bytes,sha256=EXCLUDED.sha256,telegram_file_id=EXCLUDED.telegram_file_id,telegram_file_unique_id=EXCLUDED.telegram_file_unique_id,telegram_message_id=EXCLUDED.telegram_message_id,archive_chat_id=EXCLUDED.archive_chat_id,updated_at=NOW()""",(it['source_url'],it['detail_url'],it['source_page'],it['title'],norm(it['title']),it['original_filename'],it['file_type'],it['category'],it['categories'],it['tags'],' '.join(it['tags']),it['creator'],it['creator_handle'],it['description'],it['source_date'],it['source_hits'],it['pack_count'],it['declared_size_bytes'],it['actual_size_bytes'],it['sha256'],doc['file_id'],doc.get('file_unique_id',''),msg['message_id'],int(CHAT))); q(c,'DELETE FROM stick_archive_failures WHERE source_url=%s',(it['source_url'],)); c.commit(); time.sleep(UPLOAD_DELAY); return 'archived'
     except Exception as e: record_fail(c,it,p,e); print('[failed]',it.get('original_filename'),e); return 'failed'
 def scrape(c,p):
@@ -176,7 +198,10 @@ def main():
             for p in pages:
                 if p in seen: continue
                 seen.add(p); upd(c,current_page=p,heartbeat_at=datetime.now(timezone.utc)); items,ct=scrape(c,p)
-                if not items and a.mode in ('backfill','both'): upd(c,backfill_complete=True,current_page=p); break
+                if not items and a.mode in ('backfill','both'):
+                    if p == 1:
+                        raise RuntimeError('listing page 1 returned zero archive items; refusing to mark backfill complete')
+                    upd(c,backfill_complete=True,current_page=p); break
                 for k in ct: totals[k]+=ct[k]
                 totals['pages']+=1
                 if a.mode in ('backfill','both') and p>= (a.start_page if a.start_page>0 else int(st['backfill_next_page'] or 1)): upd(c,backfill_next_page=p+1)
@@ -184,4 +209,11 @@ def main():
             upd(c,status='waiting',run_finished_at=datetime.now(timezone.utc),last_error=''); print('[done]',totals)
         except Exception as e: upd(c,status='stalled',run_finished_at=datetime.now(timezone.utc),last_error=str(e)[:1000]); raise
         finally: q(c,'SELECT pg_advisory_unlock(%s)',(88442211,)); c.commit()
-if __name__=='__main__': main()
+if __name__=='__main__':
+    try:
+        main()
+    finally:
+        if web_retriever is not None:
+            web_retriever.close()
+        if _chrome_session is not None:
+            _chrome_session.close()
