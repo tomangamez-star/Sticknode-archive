@@ -65,12 +65,12 @@ def get(url, timeout=45):
             
             r = s._driver.get(url) # Navigate using Selenium; timeout is set via set_page_load_timeout()
 
-print("[debug] PAGE TITLE:", s._driver.title)
-print("[debug] CURRENT URL:", s._driver.current_url)
-print("[debug] HTML LENGTH:", len(s._driver.page_source))
-print("[debug] PAGE PREVIEW:", s._driver.page_source[:500].replace("\n", " "))
+            print("[debug] PAGE TITLE:", s._driver.title)
+            print("[debug] CURRENT URL:", s._driver.current_url)
+            print("[debug] HTML LENGTH:", len(s._driver.page_source))
+            print("[debug] PAGE PREVIEW:", s._driver.page_source[:500].replace("\n", " "))
 
-time.sleep(max(0.1, float(os.getenv('SCRAPER_SITE_DELAY_MS','350'))/1000))
+            time.sleep(max(0.1, float(os.getenv('SCRAPER_SITE_DELAY_MS','350'))/1000))
             
             status_code = s._driver.current_url  # Check redirect loop or final URL logic here if complex
             text_content = s._driver.page_source
