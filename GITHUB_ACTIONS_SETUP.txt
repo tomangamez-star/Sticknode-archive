@@ -1,18 +1,50 @@
-GITHUB ACTIONS — PYTHON INGEST
+GITHUB ACTIONS — PYTHON INGEST + MINI RETRIEVER
 
-The archive scraping job now runs directly on GitHub Actions. Render remains the Telegram bot/search host.
+The archive job still runs in GitHub Actions. Render remains the Telegram bot/search host.
 
 Required GitHub repository secrets:
 - TELEGRAM_TOKEN
 - DATABASE_URL
 - ARCHIVE_CHAT_ID
+- SCRAPERAPI_KEY
 
-No RENDER_INGEST_URL or RENDER_INGEST_SECRET is required for the archive-ingest workflow.
+How the fetch path works now:
+  python_ingest/ingest.py
+        -> python_retriever/retriever.py
+        -> ScraperAPI standard API endpoint
+        -> target response
+        -> existing parser / SHA-256 / PostgreSQL / Telegram archive
 
-Python dependencies are already declared in requirements.txt, including curl_cffi. GitHub installs them automatically with:
-  pip install -r requirements.txt
+The existing Chrome/undetected-chromedriver code is still present. It is now lazy and only starts if:
+  INGEST_FETCH_PROVIDER=chrome
 
-Run: Actions -> Stick Nodes archive ingest -> Run workflow.
-Start with backfill_pages=1 for the first test.
+The GitHub workflow uses:
+  INGEST_FETCH_PROVIDER=retriever
+  RETRIEVER_PROVIDER=scraperapi
 
-Important: curl_cffi is used here as the HTTP client for ordinary requests. This project does not configure challenge circumvention or browser-fingerprint impersonation.
+ScraperAPI key setup:
+1. Create/sign in to a ScraperAPI account.
+2. Copy the API key from the ScraperAPI dashboard.
+3. GitHub repo -> Settings -> Secrets and variables -> Actions.
+4. New repository secret.
+5. Name: SCRAPERAPI_KEY
+6. Value: paste the API key.
+7. Save.
+
+Then run:
+  Actions -> Stick Nodes archive ingest -> Run workflow
+
+FIRST TEST:
+  mode=backfill
+  backfill_pages=1
+  recent_pages=1
+  start_page=1
+
+Expected log near the top:
+  [fetch] provider=scraperapi url=...
+not:
+  [init] Starting Chrome...
+
+The integration uses ScraperAPI's standard endpoint only. It does not turn on premium,
+rendering, CAPTCHA-solving, or stealth options. Verification/interstitial HTML is still
+detected and rejected instead of being archived as a real page/file.
