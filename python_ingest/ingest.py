@@ -172,6 +172,57 @@ def upd(c,**kw):
 def record_fail(c,it,p,e): q(c,"""INSERT INTO stick_archive_failures(source_url,detail_url,gallery_page,error_text,attempts,last_seen_at) VALUES(%s,%s,%s,%s,1,NOW()) ON CONFLICT(source_url) DO UPDATE SET detail_url=EXCLUDED.detail_url,gallery_page=EXCLUDED.gallery_page,error_text=EXCLUDED.error_text,attempts=stick_archive_failures.attempts+1,last_seen_at=NOW()""",(it.get('source_url') or it.get('download_url') or f'page:{p}',it.get('detail_url',''),p,str(e)[:1200])); c.commit()
 def caption(it):
     t=' '.join('#'+re.sub(r'[^a-z0-9_]+','',x,flags=re.I) for x in it['tags'][:8]); return '\n'.join(x for x in [f"📦 <b>{html.escape(it['title'])}</b>",f"🗂 {html.escape(it['file_type'])} → {html.escape(it['category'])}",f"📄 <code>{html.escape(it['original_filename'])}</code>",f"📅 {html.escape(it['source_date'])}" if it['source_date'] else '',f"🏷 {html.escape(t)}" if t else '',f"🔗 <a href=\"{html.escape(it['detail_url'])}\">Original page</a>" if it['detail_url'] else ''] if x)[:1000]
+def telegram_error_text(resp):
+    try:
+        payload = resp.json()
+        return clean(payload.get('description') or payload)
+    except Exception:
+        return clean(resp.text)[:1000] or f'HTTP {resp.status_code}'
+
+def validate_archive_chat():
+    resp = telegram_requests.get(
+        f'https://api.telegram.org/bot{TOKEN}/getChat',
+        params={'chat_id': CHAT},
+        timeout=30,
+    )
+    if not resp.ok:
+        raise RuntimeError(
+            f"Telegram archive chat check failed ({resp.status_code}): {telegram_error_text(resp)}"
+        )
+    data = resp.json().get('result') or {}
+    print(
+        f"[telegram] archive chat OK id={data.get('id')} "
+        f"type={data.get('type')} title={data.get('title') or data.get('username') or 'n/a'}"
+    )
+
+def send_archive_document(it, data, content_type):
+    resp = telegram_requests.post(
+        f'https://api.telegram.org/bot{TOKEN}/sendDocument',
+        data={
+            'chat_id': CHAT,
+            'caption': caption(it),
+            'parse_mode': 'HTML',
+        },
+        files={
+            'document': (
+                it['original_filename'],
+                data,
+                content_type or 'application/octet-stream',
+            )
+        },
+        timeout=90,
+    )
+    if not resp.ok:
+        raise RuntimeError(
+            f"Telegram sendDocument failed ({resp.status_code}): {telegram_error_text(resp)}"
+        )
+    payload = resp.json()
+    if not payload.get('ok'):
+        raise RuntimeError(
+            f"Telegram sendDocument failed: {clean(payload.get('description') or payload)}"
+        )
+    return payload['result']
+
 def process(c,it,p):
     if q(c,'SELECT id FROM stick_archive_files WHERE source_url=%s AND telegram_file_id IS NOT NULL LIMIT 1',(it['source_url'],)): return 'skipped'
     try:
@@ -183,7 +234,7 @@ def process(c,it,p):
         it['actual_size_bytes']=len(data); it['sha256']=hashlib.sha256(data).hexdigest()
         dup=q(c,'SELECT id FROM stick_archive_files WHERE sha256=%s AND telegram_file_id IS NOT NULL LIMIT 1',(it['sha256'],))
         if dup: q(c,'INSERT INTO stick_archive_aliases(source_url,file_id) VALUES(%s,%s) ON CONFLICT(source_url) DO UPDATE SET file_id=EXCLUDED.file_id',(it['source_url'],dup[0]['id'])); c.commit(); return 'duplicate'
-        tr=telegram_requests.post(f'https://api.telegram.org/bot{TOKEN}/sendDocument',data={'chat_id':CHAT,'caption':caption(it),'parse_mode':'HTML'},files={'document':(it['original_filename'],data,r.headers.get('content-type','application/octet-stream'))},timeout=90); tr.raise_for_status(); msg=tr.json()['result']; doc=msg['document']
+        msg=send_archive_document(it, data, r.headers.get('content-type','application/octet-stream')); doc=msg['document']
         q(c,"""INSERT INTO stick_archive_files(source_url,detail_url,source_page,title,normalized_title,original_filename,file_type,category,categories,tags,tags_text,creator,creator_handle,description,source_date,source_hits,pack_count,declared_size_bytes,actual_size_bytes,sha256,telegram_file_id,telegram_file_unique_id,telegram_message_id,archive_chat_id,updated_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW()) ON CONFLICT(source_url) DO UPDATE SET title=EXCLUDED.title,normalized_title=EXCLUDED.normalized_title,original_filename=EXCLUDED.original_filename,file_type=EXCLUDED.file_type,category=EXCLUDED.category,categories=EXCLUDED.categories,tags=EXCLUDED.tags,tags_text=EXCLUDED.tags_text,actual_size_bytes=EXCLUDED.actual_size_bytes,sha256=EXCLUDED.sha256,telegram_file_id=EXCLUDED.telegram_file_id,telegram_file_unique_id=EXCLUDED.telegram_file_unique_id,telegram_message_id=EXCLUDED.telegram_message_id,archive_chat_id=EXCLUDED.archive_chat_id,updated_at=NOW()""",(it['source_url'],it['detail_url'],it['source_page'],it['title'],norm(it['title']),it['original_filename'],it['file_type'],it['category'],it['categories'],it['tags'],' '.join(it['tags']),it['creator'],it['creator_handle'],it['description'],it['source_date'],it['source_hits'],it['pack_count'],it['declared_size_bytes'],it['actual_size_bytes'],it['sha256'],doc['file_id'],doc.get('file_unique_id',''),msg['message_id'],int(CHAT))); q(c,'DELETE FROM stick_archive_failures WHERE source_url=%s',(it['source_url'],)); c.commit(); time.sleep(UPLOAD_DELAY); return 'archived'
     except Exception as e: record_fail(c,it,p,e); print('[failed]',it.get('original_filename'),e); return 'failed'
 def scrape(c,p):
@@ -192,6 +243,7 @@ def scrape(c,p):
     return items,counts
 
 def main():
+    validate_archive_chat()
     ap=argparse.ArgumentParser(); ap.add_argument('--mode',choices=['backfill','recent','both'],default='backfill'); ap.add_argument('--backfill-pages',type=int,default=25); ap.add_argument('--recent-pages',type=int,default=3); ap.add_argument('--start-page',type=int,default=0); a=ap.parse_args()
     with conn() as c:
         got=q(c,'SELECT pg_try_advisory_lock(%s) locked',(88442211,))[0]['locked']
