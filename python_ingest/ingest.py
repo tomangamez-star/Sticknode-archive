@@ -15,12 +15,12 @@ MAX_MB=min(49,max(1,int(os.getenv('SCRAPER_MAX_FILE_MB','45')))); MAX_BYTES=MAX_
 FETCH_DETAILS=os.getenv('SCRAPER_FETCH_DETAILS','true').lower() in ('1','true','yes','on')
 
 # <--- ADD THESE LINES BELOW (Undetected Chrome Setup) ---
-from undetected_chromedriver import ChromeOptions, webdriver as uc_driver
+import undetected_chromedriver as uc
 import sys
 
 class CustomSession:
     def __init__(self):
-        self.options = ChromeOptions()
+        self.options = uc.ChromeOptions()
         
         # Emulate real user profile to bypass Cloudflare checks
         self.user_data_dir = os.path.join(os.getcwd(), ".sticknodes_profile") 
@@ -90,12 +90,12 @@ def _get_raw_response(url):
         return dict(content=r.page_source.encode('utf-8'), status_code=200, headers={})
     except Exception as e: raise RuntimeError(f"Browser fetch failed: {e}")
 # <--- ADD THESE LINES BELOW (Undetected Chrome Setup) ---
-from undetected_chromedriver import ChromeOptions, webdriver as uc_driver
+import undetected_chromedriver as uc
 import sys
 
 class CustomSession:
     def __init__(self):
-        self.options = ChromeOptions()
+        self.options = uc.ChromeOptions()
         
         # Emulate real user profile to bypass Cloudflare checks
         self.user_data_dir = os.path.join(os.getcwd(), ".sticknodes_profile") 
