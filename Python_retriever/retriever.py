@@ -42,6 +42,9 @@ MAX_HTML_BYTES = max(64 * 1024, min(10 * 1024 * 1024, int(os.getenv("RETRIEVER_M
 CACHE_MINUTES = max(1, min(7 * 24 * 60, int(os.getenv("RETRIEVER_CACHE_MINUTES", "60"))))
 RESPECT_ROBOTS = os.getenv("RETRIEVER_RESPECT_ROBOTS", "true").lower() in ("1", "true", "yes", "on")
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+RETRIEVER_PROVIDER = os.getenv("RETRIEVER_PROVIDER", "direct").strip().lower()
+SCRAPERAPI_KEY = os.getenv("SCRAPERAPI_KEY", "").strip()
+SCRAPERAPI_ENDPOINT = os.getenv("SCRAPERAPI_ENDPOINT", "https://api.scraperapi.com/").strip()
 
 
 class RetrieverError(RuntimeError):
@@ -54,6 +57,25 @@ class BlockedPageError(RetrieverError):
 
 class DisallowedUrlError(RetrieverError):
     pass
+
+
+@dataclass
+class RawResponse:
+    url: str
+    final_url: str
+    status_code: int
+    content_type: str
+    headers: dict
+    content: bytes
+    fetch_ms: int
+
+    @property
+    def text(self) -> str:
+        return self.content.decode("utf-8", errors="replace")
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RetrieverError(f"HTTP {self.status_code} while fetching {self.url}")
 
 
 @dataclass
@@ -203,7 +225,7 @@ class RobotsCache:
     def __init__(self):
         self._items: dict[str, RobotFileParser] = {}
 
-    def allowed(self, session, url: str) -> bool:
+    def allowed(self, client, url: str) -> bool:
         if not RESPECT_ROBOTS:
             return True
         parts = urlsplit(url)
@@ -212,27 +234,36 @@ class RobotsCache:
             rp = RobotFileParser()
             robots_url = origin + "/robots.txt"
             try:
-                response = _request_with_safe_redirects(
-                    session,
+                response = client.raw_fetch(
                     robots_url,
                     timeout=DEFAULT_TIMEOUT,
-                    headers={"User-Agent": DEFAULT_UA, "Accept": "text/plain,*/*;q=0.1"},
+                    respect_robots=False,
+                    accept="text/plain,*/*;q=0.1",
                 )
                 if response.status_code >= 400:
                     rp.parse([])
                 else:
                     rp.parse(response.text.splitlines())
+            except BlockedPageError:
+                raise
             except Exception:
-                # Fail open for unavailable robots.txt, not for an explicit disallow.
+                # Unavailable robots.txt is treated as no explicit disallow.
                 rp.parse([])
             self._items[origin] = rp
         return self._items[origin].can_fetch(DEFAULT_UA, url)
 
 
 class Retriever:
-    def __init__(self):
+    def __init__(self, provider: str | None = None):
         self.session = requests.Session()
         self.robots = RobotsCache()
+        self.provider = (provider or RETRIEVER_PROVIDER or "direct").strip().lower()
+        self.scraperapi_key = SCRAPERAPI_KEY
+        self.scraperapi_endpoint = SCRAPERAPI_ENDPOINT
+        if self.provider not in {"direct", "scraperapi"}:
+            raise RetrieverError("RETRIEVER_PROVIDER must be 'direct' or 'scraperapi'")
+        if self.provider == "scraperapi" and not self.scraperapi_key:
+            raise RetrieverError("SCRAPERAPI_KEY is required when RETRIEVER_PROVIDER=scraperapi")
 
     def close(self):
         try:
@@ -240,43 +271,107 @@ class Retriever:
         except Exception:
             pass
 
-    def fetch(self, raw_url: str) -> RetrievedPage:
+    def _provider_request(self, target_url: str, *, timeout: int, headers: dict):
+        target_url = validate_url(target_url)
+
+        if self.provider == "direct":
+            return _request_with_safe_redirects(
+                self.session,
+                target_url,
+                timeout=timeout,
+                headers=headers,
+            )
+
+        # Standard ScraperAPI endpoint only. We intentionally do not enable
+        # premium proxies, CAPTCHA solving, JS rendering, or stealth flags here.
+        return self.session.get(
+            self.scraperapi_endpoint,
+            params={"api_key": self.scraperapi_key, "url": target_url},
+            timeout=timeout,
+            headers={"Accept": headers.get("Accept", "*/*")},
+        )
+
+    def raw_fetch(
+        self,
+        raw_url: str,
+        *,
+        timeout: int | None = None,
+        respect_robots: bool = True,
+        accept: str = "*/*",
+    ) -> RawResponse:
         url = validate_url(raw_url)
-        if not self.robots.allowed(self.session, url):
+        if respect_robots and not self.robots.allowed(self, url):
             raise DisallowedUrlError("robots.txt disallows this retriever for the requested URL")
 
         started = time.monotonic()
-        response = _request_with_safe_redirects(
-            self.session,
+        response = self._provider_request(
             url,
-            timeout=DEFAULT_TIMEOUT,
-            headers={
-                "User-Agent": DEFAULT_UA,
-                "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.2",
-            },
+            timeout=timeout or DEFAULT_TIMEOUT,
+            headers={"User-Agent": DEFAULT_UA, "Accept": accept},
         )
-        final_url = validate_url(str(response.url))
-        content_type = str(response.headers.get("content-type", "")).lower()
-        if "text/html" not in content_type and "application/xhtml+xml" not in content_type:
-            raise RetrieverError(f"retriever only indexes HTML pages; received '{content_type or 'unknown'}'")
 
-        raw = response.content
-        if len(raw) > MAX_HTML_BYTES:
-            raise RetrieverError(f"HTML exceeds RETRIEVER_MAX_HTML_BYTES ({len(raw)} bytes)")
-        html = response.text
-        title, description, text, canonical, links = _parse_html(html, final_url)
-        blocked = _challenge_reason(response.status_code, dict(response.headers), title, html)
-        if blocked:
-            raise BlockedPageError(f"{blocked}; retriever will not bypass verification pages")
-        response.raise_for_status()
+        # ScraperAPI is a gateway, so response.url points to ScraperAPI itself.
+        # Preserve the validated target URL instead of indexing the gateway URL.
+        if self.provider == "scraperapi":
+            final_url = url
+        else:
+            final_url = validate_url(str(response.url))
+
+        content = bytes(response.content)
+        content_type = str(response.headers.get("content-type", "")).lower()
+        status_code = int(response.status_code)
+
+        # Never let a verification HTML page masquerade as a real page or file.
+        looks_html = (
+            "text/html" in content_type
+            or "application/xhtml+xml" in content_type
+            or content[:128].lstrip().lower().startswith((b"<!doctype html", b"<html"))
+        )
+        if looks_html:
+            html_text = content.decode("utf-8", errors="replace")
+            soup = BeautifulSoup(html_text, "html.parser")
+            title = " ".join(soup.title.get_text(" ", strip=True).split()) if soup.title else ""
+            blocked = _challenge_reason(status_code, dict(response.headers), title, html_text)
+            if blocked:
+                raise BlockedPageError(f"{blocked}; retriever will not treat it as target content")
+
+        if status_code >= 400:
+            raise RetrieverError(f"HTTP {status_code} while fetching {url}")
 
         elapsed = int((time.monotonic() - started) * 1000)
-        digest = hashlib.sha256(raw).hexdigest()
-        return RetrievedPage(
+        return RawResponse(
             url=url,
             final_url=final_url,
+            status_code=status_code,
+            content_type=content_type,
+            headers=dict(response.headers),
+            content=content,
+            fetch_ms=elapsed,
+        )
+
+    def fetch(self, raw_url: str) -> RetrievedPage:
+        raw_response = self.raw_fetch(
+            raw_url,
+            timeout=DEFAULT_TIMEOUT,
+            accept="text/html,application/xhtml+xml;q=0.9,*/*;q=0.2",
+        )
+        content_type = raw_response.content_type
+        if "text/html" not in content_type and "application/xhtml+xml" not in content_type:
+            raise RetrieverError(
+                f"retriever only indexes HTML pages; received '{content_type or 'unknown'}'"
+            )
+
+        raw = raw_response.content
+        if len(raw) > MAX_HTML_BYTES:
+            raise RetrieverError(f"HTML exceeds RETRIEVER_MAX_HTML_BYTES ({len(raw)} bytes)")
+        html = raw_response.text
+        title, description, text, canonical, links = _parse_html(html, raw_response.final_url)
+        digest = hashlib.sha256(raw).hexdigest()
+        return RetrievedPage(
+            url=raw_response.url,
+            final_url=raw_response.final_url,
             canonical_url=canonical,
-            status_code=int(response.status_code),
+            status_code=raw_response.status_code,
             content_type=content_type,
             title=title,
             description=description,
@@ -284,7 +379,7 @@ class Retriever:
             links=links,
             sha256=digest,
             fetched_at=datetime.now(timezone.utc).isoformat(),
-            fetch_ms=elapsed,
+            fetch_ms=raw_response.fetch_ms,
         )
 
 
