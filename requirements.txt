@@ -1,3 +1,4 @@
 curl_cffi==0.13.0
 beautifulsoup4==4.13.5
 psycopg[binary]==3.2.10
+undetected-chromedriver==3.5.5
