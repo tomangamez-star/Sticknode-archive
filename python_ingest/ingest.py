@@ -28,8 +28,6 @@ class CustomSession:
             os.makedirs(self.user_data_dir)
             
         self.options.add_argument(f"--user-data-dir={self.user_data_dir}")
-        self.options.add_experimental_option("excludeSwitches", ["enable-automation"])
-        self.options.add_experimental_option('useAutomationExtension', False)
         
         prefs = {
             "profile.default_content_setting_values": {"images": 2, "media_autoplay": 1},
@@ -103,8 +101,6 @@ class CustomSession:
             os.makedirs(self.user_data_dir)
             
         self.options.add_argument(f"--user-data-dir={self.user_data_dir}")
-        self.options.add_experimental_option("excludeSwitches", ["enable-automation"])
-        self.options.add_experimental_option('useAutomationExtension', False)
         
         prefs = {
             "profile.default_content_setting_values": {"images": 2, "media_autoplay": 1},
