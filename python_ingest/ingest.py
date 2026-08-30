@@ -11,7 +11,14 @@ from psycopg.rows import dict_row
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-from python_retriever.retriever import Retriever, RetrieverError
+try:
+    from python_retriever.retriever import Retriever, RetrieverError
+except ModuleNotFoundError as exc:
+    # GitHub repository currently has this folder as `Python_retriever`.
+    # Keep compatibility with both spellings so a later folder rename is safe.
+    if exc.name not in {"python_retriever", "python_retriever.retriever"}:
+        raise
+    from Python_retriever.retriever import Retriever, RetrieverError
 
 BASE=os.getenv('STICKNODES_BASE_URL','https://sticknodes.com').rstrip('/')
 LIST=os.getenv('STICKNODES_LIST_URL','https://sticknodes.com/stickfigures/').strip()
