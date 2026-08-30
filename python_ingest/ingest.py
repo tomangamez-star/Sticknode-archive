@@ -14,141 +14,36 @@ DELAY=max(.1,float(os.getenv('SCRAPER_SITE_DELAY_MS','350'))/1000); UPLOAD_DELAY
 MAX_MB=min(49,max(1,int(os.getenv('SCRAPER_MAX_FILE_MB','45')))); MAX_BYTES=MAX_MB*1024*1024
 FETCH_DETAILS=os.getenv('SCRAPER_FETCH_DETAILS','true').lower() in ('1','true','yes','on')
 
-# <--- ADD THESE LINES BELOW (Undetected Chrome Setup) ---
+# Browser setup for GitHub Actions / CI
 import undetected_chromedriver as uc
 import sys
 
 class CustomSession:
     def __init__(self):
         self.options = uc.ChromeOptions()
-        
-        # Emulate real user profile to bypass Cloudflare checks
-        self.user_data_dir = os.path.join(os.getcwd(), ".sticknodes_profile") 
-        if not os.path.exists(self.user_data_dir):
-            os.makedirs(self.user_data_dir)
-            
-        self.options.add_argument(f"--user-data-dir={self.user_data_dir}")
-        
-        prefs = {
-            "profile.default_content_setting_values": {"images": 2, "media_autoplay": 1},
-            "credentials_enable_service": False,
-            "profile.managed_default_content_settings": {5: 2}
-        }
-        self.options.experimental_options["prefs"] = prefs
-        
-        # Initialize the headless browser instance once per session or on demand
-        # For scraping loops, keeping it alive in a global variable is often better.
+        self.options.add_argument("--headless=new")
+        self.options.add_argument("--no-sandbox")
+        self.options.add_argument("--disable-dev-shm-usage")
+        self.options.add_argument("--window-size=1280,720")
+
         try:
-            if not hasattr(self, '_driver'):
-                sys.stdout.write(f"[init] Starting Undetected Chrome...\n")
-                self._driver = uc.Chrome(options=self.options)
-                time.sleep(0.5) # Allow driver to initialize before navigation
-                
-                # Simulate initial human behavior (load homepage)
-                self._driver.get(BASE + '/about') 
-                
-            return True  # Signal initialization success
+            sys.stdout.write("[init] Starting Chrome...\n")
+            self._driver = uc.Chrome(options=self.options)
+            self._driver.set_page_load_timeout(45)
+            time.sleep(0.5)
+            return
         except Exception as e:
             print(f"[Error] Browser init failed: {e}")
             raise
 
-    def get_request_url(self, url):
-        """Wrapper method that uses the real browser for HTTP requests"""
-        try:
-            if not hasattr(self, '_driver'):
-                 sys.stdout.write(f"[init] Starting Undetected Chrome...\n")
-                 self._driver = uc.Chrome(options=self.options)
-            
-            r = self._driver.execute_cdp_cmd("Network.enable", {})
-            r = self._driver.get(url) 
-            
-            # Extract response text using Selenium's page source (which includes JS-rendered content)
-            time.sleep(DELAY + 0.2) # Ensure full rendering before reading source
-            
-            return BeautifulSoup(r.page_source, 'html.parser'), {'status_code': 200}
-
-        except Exception as e:
-             print(f"[Error Request] {e}")
-             raise
-    
     def close(self):
-        if hasattr(self, '_driver'):
+        if hasattr(self, "_driver"):
             self._driver.quit()
 
-s = CustomSession()  # <--- REPLACE GLOBAL `s` with this instance
+s = CustomSession()
 
 UA=os.getenv('STICKNODES_USER_AGENT','Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/139.0.0.0 Safari/537.36')
 CATS=['Backgrounds','Effects','Miscellaneous','Objects','Packs','People','Weapons','Vehicles']
-
-# Helper to get raw response headers/content for Telegram upload later if needed from browser:
-def _get_raw_response(url):
-    """Helper to get the actual binary content or redirects"""
-    try: 
-        r = s._driver.get(url, timeout=45) # Use standard selenium get
-        return dict(content=r.page_source.encode('utf-8'), status_code=200, headers={})
-    except Exception as e: raise RuntimeError(f"Browser fetch failed: {e}")
-# <--- ADD THESE LINES BELOW (Undetected Chrome Setup) ---
-import undetected_chromedriver as uc
-import sys
-
-class CustomSession:
-    def __init__(self):
-        self.options = uc.ChromeOptions()
-        
-        # Emulate real user profile to bypass Cloudflare checks
-        self.user_data_dir = os.path.join(os.getcwd(), ".sticknodes_profile") 
-        if not os.path.exists(self.user_data_dir):
-            os.makedirs(self.user_data_dir)
-            
-        self.options.add_argument(f"--user-data-dir={self.user_data_dir}")
-        
-        prefs = {
-            "profile.default_content_setting_values": {"images": 2, "media_autoplay": 1},
-            "credentials_enable_service": False,
-            "profile.managed_default_content_settings": {5: 2}
-        }
-        self.options.experimental_options["prefs"] = prefs
-        
-        # Initialize the headless browser instance once per session or on demand
-        try:
-            if not hasattr(self, '_driver'):
-                sys.stdout.write(f"[init] Starting Undetected Chrome...\n")
-                self._driver = uc.Chrome(options=self.options)
-                time.sleep(0.5) 
-
-                # Simulate initial human behavior (load homepage)
-                self._driver.get(BASE + '/about') 
-                
-            return True  
-        except Exception as e:
-            print(f"[Error] Browser init failed: {e}")
-            raise
-
-    def get_request_url(self, url):
-         """Wrapper method that uses the real browser for HTTP requests"""
-         try:
-             if not hasattr(self, '_driver'):
-                  sys.stdout.write(f"[init] Starting Undetected Chrome...\n")
-                  self._driver = uc.Chrome(options=self.options)
-             
-             r = self._driver.execute_cdp_cmd("Network.enable", {})
-             r = self._driver.get(url) 
-
-              # Extract response text using Selenium's page source (which includes JS-rendered content)
-             time.sleep(DELAY + 0.2) 
-
-             return BeautifulSoup(r.page_source, 'html.parser'), {'status_code': 200}
-
-         except Exception as e:
-              print(f"[Error Request] {e}")
-              raise
-     
-    def close(self):
-        if hasattr(self, '_driver'):
-            self._driver.quit()
-
-
-s = CustomSession() 
 
 def clean(x): return re.sub(r'\s+',' ',str(x or '')).strip()
 def fname(url): return unquote(urlparse(url).path.rsplit('/',1)[-1])
