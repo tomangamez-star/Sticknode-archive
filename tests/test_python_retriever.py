@@ -58,6 +58,66 @@ class RetrieverParserTests(unittest.TestCase):
         with self.assertRaises(retriever.DisallowedUrlError):
             retriever.validate_url("https://not-example.test/")
 
+    @patch.dict(os.environ, {
+        "RETRIEVER_ALLOWED_HOSTS": "example.com",
+        "SCRAPERAPI_KEY": "test-key",
+    })
+    @patch("socket.getaddrinfo")
+    def test_scraperapi_standard_endpoint_only(self, mocked_dns):
+        mocked_dns.return_value = [(2, 1, 6, "", ("93.184.216.34", 443))]
+
+        class FakeResponse:
+            status_code = 200
+            url = "https://api.scraperapi.com/"
+            headers = {"content-type": "text/html"}
+            content = b"<html><head><title>OK</title></head><body>Hello</body></html>"
+
+        class FakeSession:
+            def __init__(self):
+                self.calls = []
+            def get(self, url, **kwargs):
+                self.calls.append((url, kwargs))
+                return FakeResponse()
+            def close(self):
+                pass
+
+        with patch.object(retriever, "SCRAPERAPI_KEY", "test-key"):
+            client = retriever.Retriever(provider="scraperapi")
+        client.session = FakeSession()
+        raw = client.raw_fetch("https://example.com/page", respect_robots=False)
+        self.assertEqual(raw.status_code, 200)
+        endpoint, kwargs = client.session.calls[0]
+        self.assertEqual(endpoint, client.scraperapi_endpoint)
+        self.assertEqual(kwargs["params"], {
+            "api_key": "test-key",
+            "url": "https://example.com/page",
+        })
+        self.assertNotIn("render", kwargs["params"])
+        self.assertNotIn("premium", kwargs["params"])
+        self.assertNotIn("session_number", kwargs["params"])
+
+    @patch.dict(os.environ, {"RETRIEVER_ALLOWED_HOSTS": "example.com"})
+    @patch("socket.getaddrinfo")
+    def test_raw_fetch_rejects_challenge_html(self, mocked_dns):
+        mocked_dns.return_value = [(2, 1, 6, "", ("93.184.216.34", 443))]
+
+        class FakeResponse:
+            status_code = 200
+            url = "https://example.com/"
+            headers = {"content-type": "text/html"}
+            content = b"<html><head><title>Just a moment...</title></head><body>Cloudflare <script src='https://challenges.cloudflare.com/x'></script></body></html>"
+
+        class FakeSession:
+            def get(self, *a, **k):
+                return FakeResponse()
+            def close(self):
+                pass
+
+        client = retriever.Retriever(provider="direct")
+        client.session = FakeSession()
+        with self.assertRaises(retriever.BlockedPageError):
+            client.raw_fetch("https://example.com/", respect_robots=False)
+
 
 if __name__ == "__main__":
     unittest.main()
