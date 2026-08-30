@@ -46,6 +46,12 @@ jobs:
       SCRAPER_UPLOAD_DELAY_MS: '1100'
       SCRAPER_MAX_FILE_MB: '45'
       SCRAPER_FETCH_DETAILS: 'true'
+      INGEST_FETCH_PROVIDER: retriever
+      RETRIEVER_PROVIDER: scraperapi
+      RETRIEVER_ALLOWED_HOSTS: sticknodes.com
+      RETRIEVER_RESPECT_ROBOTS: 'true'
+      RETRIEVER_TIMEOUT_SECONDS: '60'
+      SCRAPERAPI_KEY: ${{ secrets.SCRAPERAPI_KEY }}
 
     steps:
       - name: Checkout repository
@@ -57,6 +63,12 @@ jobs:
           cache: pip
       - name: Install Python dependencies
         run: pip install -r requirements.txt
+      - name: Validate ScraperAPI secret
+        run: |
+          if [ -z "$SCRAPERAPI_KEY" ]; then
+            echo "Missing GitHub secret: SCRAPERAPI_KEY"
+            exit 1
+          fi
       - name: Run Python ingestion
         run: >-
           python python_ingest/ingest.py
