@@ -28,7 +28,7 @@ class CustomSession:
 
         try:
             sys.stdout.write("[init] Starting Chrome...\n")
-            self._driver = uc.Chrome(options=self.options)
+            self._driver = uc.Chrome(options=self.options, version_main=151)
             self._driver.set_page_load_timeout(45)
             time.sleep(0.5)
             return
