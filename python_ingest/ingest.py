@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from urllib.parse import urljoin, urlparse, unquote
 from bs4 import BeautifulSoup
 from curl_cffi import requests as http_requests
+import requests as telegram_requests
 import psycopg
 from psycopg.rows import dict_row
 
@@ -182,7 +183,7 @@ def process(c,it,p):
         it['actual_size_bytes']=len(data); it['sha256']=hashlib.sha256(data).hexdigest()
         dup=q(c,'SELECT id FROM stick_archive_files WHERE sha256=%s AND telegram_file_id IS NOT NULL LIMIT 1',(it['sha256'],))
         if dup: q(c,'INSERT INTO stick_archive_aliases(source_url,file_id) VALUES(%s,%s) ON CONFLICT(source_url) DO UPDATE SET file_id=EXCLUDED.file_id',(it['source_url'],dup[0]['id'])); c.commit(); return 'duplicate'
-        tr=http_requests.post(f'https://api.telegram.org/bot{TOKEN}/sendDocument',data={'chat_id':CHAT,'caption':caption(it),'parse_mode':'HTML'},files={'document':(it['original_filename'],data,r.headers.get('content-type','application/octet-stream'))},timeout=90); tr.raise_for_status(); msg=tr.json()['result']; doc=msg['document']
+        tr=telegram_requests.post(f'https://api.telegram.org/bot{TOKEN}/sendDocument',data={'chat_id':CHAT,'caption':caption(it),'parse_mode':'HTML'},files={'document':(it['original_filename'],data,r.headers.get('content-type','application/octet-stream'))},timeout=90); tr.raise_for_status(); msg=tr.json()['result']; doc=msg['document']
         q(c,"""INSERT INTO stick_archive_files(source_url,detail_url,source_page,title,normalized_title,original_filename,file_type,category,categories,tags,tags_text,creator,creator_handle,description,source_date,source_hits,pack_count,declared_size_bytes,actual_size_bytes,sha256,telegram_file_id,telegram_file_unique_id,telegram_message_id,archive_chat_id,updated_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW()) ON CONFLICT(source_url) DO UPDATE SET title=EXCLUDED.title,normalized_title=EXCLUDED.normalized_title,original_filename=EXCLUDED.original_filename,file_type=EXCLUDED.file_type,category=EXCLUDED.category,categories=EXCLUDED.categories,tags=EXCLUDED.tags,tags_text=EXCLUDED.tags_text,actual_size_bytes=EXCLUDED.actual_size_bytes,sha256=EXCLUDED.sha256,telegram_file_id=EXCLUDED.telegram_file_id,telegram_file_unique_id=EXCLUDED.telegram_file_unique_id,telegram_message_id=EXCLUDED.telegram_message_id,archive_chat_id=EXCLUDED.archive_chat_id,updated_at=NOW()""",(it['source_url'],it['detail_url'],it['source_page'],it['title'],norm(it['title']),it['original_filename'],it['file_type'],it['category'],it['categories'],it['tags'],' '.join(it['tags']),it['creator'],it['creator_handle'],it['description'],it['source_date'],it['source_hits'],it['pack_count'],it['declared_size_bytes'],it['actual_size_bytes'],it['sha256'],doc['file_id'],doc.get('file_unique_id',''),msg['message_id'],int(CHAT))); q(c,'DELETE FROM stick_archive_failures WHERE source_url=%s',(it['source_url'],)); c.commit(); time.sleep(UPLOAD_DELAY); return 'archived'
     except Exception as e: record_fail(c,it,p,e); print('[failed]',it.get('original_filename'),e); return 'failed'
 def scrape(c,p):
