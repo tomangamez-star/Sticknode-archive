@@ -1,56 +1,18 @@
-STICK NODES ARCHIVE — GITHUB ACTIONS + RENDER INGESTION
-========================================================
+GITHUB ACTIONS — PYTHON INGEST
 
-WHY THIS VERSION
-----------------
-GitHub-hosted runners received HTTP 403 from StickNodes.com.
-This workflow no longer scrapes StickNodes directly.
-GitHub Actions securely tells the already-deployed Render service to ingest,
-and then follows the Render job until it finishes.
+The archive scraping job now runs directly on GitHub Actions. Render remains the Telegram bot/search host.
 
-RENDER ENVIRONMENT VARIABLES
-----------------------------
-Keep your existing values:
-  TELEGRAM_TOKEN
-  DATABASE_URL
-  ARCHIVE_CHAT_ID
-  OWNER_ID
+Required GitHub repository secrets:
+- TELEGRAM_TOKEN
+- DATABASE_URL
+- ARCHIVE_CHAT_ID
 
-Add:
-  INGEST_API_SECRET
-    - Make this a long random private value.
-    - Example generation: any password manager's 32+ character random password.
+No RENDER_INGEST_URL or RENDER_INGEST_SECRET is required for the archive-ingest workflow.
 
-Optional:
-  INGEST_NOTIFICATION_CHAT_ID
-    - Your Telegram numeric user/chat ID if you want start/finish/failure messages.
-    - It can be the same numeric ID you use for OWNER_ID.
+Python dependencies are already declared in requirements.txt, including curl_cffi. GitHub installs them automatically with:
+  pip install -r requirements.txt
 
-GITHUB ACTIONS SECRETS
-----------------------
-Repository -> Settings -> Secrets and variables -> Actions
+Run: Actions -> Stick Nodes archive ingest -> Run workflow.
+Start with backfill_pages=1 for the first test.
 
-Add ONLY:
-  RENDER_INGEST_URL
-    - Your public Render service URL, e.g. https://your-service.onrender.com
-    - Do not add /admin/ingest at the end.
-
-  RENDER_INGEST_SECRET
-    - EXACTLY the same value as Render INGEST_API_SECRET.
-
-The old TELEGRAM_TOKEN, DATABASE_URL, ARCHIVE_CHAT_ID and OWNER_ID GitHub secrets
-are no longer needed by this workflow. You may remove them from GitHub after this
-version is committed; Render still needs its own copies.
-
-RUN
----
-Actions -> Stick Nodes archive ingest -> Run workflow
-Recommended first run:
-  mode: backfill
-  backfill_pages: 25
-  recent_pages: 3
-  retry_failures: true
-  start_page: 0
-
-If Render is temporarily doing its automatic recent sync, GitHub waits/retries.
-The endpoint returns immediately, so a long scrape does not depend on one long HTTP request.
+Important: curl_cffi is used here as the HTTP client for ordinary requests. This project does not configure challenge circumvention or browser-fingerprint impersonation.
