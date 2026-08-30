@@ -63,7 +63,7 @@ def get(url, timeout=45):
             # Execute network enable to handle redirects properly via CDP if needed
             s._driver.execute_cdp_cmd("Network.enable", {}) 
             
-            r = s._driver.get(url, timeout=timeout) # Navigate using Selenium
+            r = s._driver.get(url) # Navigate using Selenium; timeout is set via set_page_load_timeout()
             
             time.sleep(max(0.1, float(os.getenv('SCRAPER_SITE_DELAY_MS','350'))/1000)) # Small delay between requests
             
