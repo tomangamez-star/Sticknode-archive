@@ -18,6 +18,10 @@ services:
         sync: false
       - key: OWNER_ID
         sync: false
+      - key: INGEST_API_SECRET
+        sync: false
+      - key: INGEST_NOTIFICATION_CHAT_ID
+        sync: false
       - key: NODE_ENV
         value: production
       - key: PORT
