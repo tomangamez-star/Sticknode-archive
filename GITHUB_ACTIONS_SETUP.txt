@@ -8,6 +8,10 @@ Required GitHub repository secrets:
 - ARCHIVE_CHAT_ID
 - SCRAPERAPI_KEY
 
+Optional but recommended for private error alerts:
+- INGEST_NOTIFICATION_CHAT_ID (your Telegram numeric user/chat ID)
+- OWNER_ID (fallback if INGEST_NOTIFICATION_CHAT_ID is empty)
+
 How the fetch path works now:
   python_ingest/ingest.py
         -> python_retriever/retriever.py
@@ -48,3 +52,35 @@ not:
 The integration uses ScraperAPI's standard endpoint only. It does not turn on premium,
 rendering, CAPTCHA-solving, or stealth options. Verification/interstitial HTML is still
 detected and rejected instead of being archived as a real page/file.
+
+
+ERROR ALERTS + PROVIDER SAFETY
+
+The Python ingest now retries temporary/repeated retrieval-provider HTTP errors before giving up.
+Default retry policy in GitHub Actions:
+- SCRAPER_PROVIDER_RETRIES=2 (3 total attempts including the first request)
+- SCRAPER_PROVIDER_RETRY_DELAY_SECONDS=5 (backoff: 5s, then 10s)
+
+If ScraperAPI/retrieval repeatedly returns HTTP 401/403/408/425/429/500/502/503/504:
+- the current page stops early
+- that provider outage is NOT written as a per-file archive failure
+- backfill_next_page is NOT advanced past the unfinished page
+- the next start_page=0 run resumes that page and skips files already archived successfully
+- a Telegram error alert is sent when INGEST_NOTIFICATION_CHAT_ID (or OWNER_ID fallback) is configured
+
+To receive alerts in your Telegram DM:
+1. Open the archive bot in Telegram and press Start / send it a message once.
+2. Get your numeric Telegram user ID.
+3. GitHub repo -> Settings -> Secrets and variables -> Actions -> New repository secret.
+4. Name it: INGEST_NOTIFICATION_CHAT_ID
+5. Paste your numeric Telegram user ID and save.
+
+Example alert:
+  🚨 Stick Nodes ingest stopped — retrieval provider
+  Problem: scraperapi returned HTTP 403 repeatedly (3 attempts).
+  Page: 27
+  Resume page: 27
+  Archived this run: ...
+  Resume state is preserved; completed pages will not be redownloaded.
+
+The alert also includes the GitHub Actions run link when GitHub exposes the run metadata.
