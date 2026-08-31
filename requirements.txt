@@ -3,3 +3,4 @@ beautifulsoup4==4.13.5
 psycopg[binary]==3.2.10
 undetected-chromedriver==3.5.5
 requests==2.34.2
+playwright==1.62.0
