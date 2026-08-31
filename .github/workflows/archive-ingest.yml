@@ -50,12 +50,10 @@ jobs:
       SCRAPER_FETCH_DETAILS: 'true'
       SCRAPER_PROVIDER_RETRIES: '2'
       SCRAPER_PROVIDER_RETRY_DELAY_SECONDS: '5'
-      INGEST_FETCH_PROVIDER: retriever
-      RETRIEVER_PROVIDER: scraperapi
+      INGEST_FETCH_PROVIDER: chrome
       RETRIEVER_ALLOWED_HOSTS: sticknodes.com
       RETRIEVER_RESPECT_ROBOTS: 'true'
       RETRIEVER_TIMEOUT_SECONDS: '60'
-      SCRAPERAPI_KEY: ${{ secrets.SCRAPERAPI_KEY }}
 
     steps:
       - name: Checkout repository
@@ -67,12 +65,8 @@ jobs:
           cache: pip
       - name: Install Python dependencies
         run: pip install -r requirements.txt
-      - name: Validate ScraperAPI secret
-        run: |
-          if [ -z "$SCRAPERAPI_KEY" ]; then
-            echo "Missing GitHub secret: SCRAPERAPI_KEY"
-            exit 1
-          fi
+      - name: Install Playwright Chromium
+        run: python -m playwright install --with-deps chromium
       - name: Run Python ingestion
         run: >-
           python python_ingest/ingest.py
