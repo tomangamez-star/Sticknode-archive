@@ -27,6 +27,25 @@ TOKEN=os.environ['TELEGRAM_TOKEN'].strip(); CHAT=os.environ['ARCHIVE_CHAT_ID'].s
 DELAY=max(.1,float(os.getenv('SCRAPER_SITE_DELAY_MS','350'))/1000); UPLOAD_DELAY=max(.25,float(os.getenv('SCRAPER_UPLOAD_DELAY_MS','1100'))/1000)
 MAX_MB=min(49,max(1,int(os.getenv('SCRAPER_MAX_FILE_MB','45')))); MAX_BYTES=MAX_MB*1024*1024
 FETCH_DETAILS=os.getenv('SCRAPER_FETCH_DETAILS','true').lower() in ('1','true','yes','on')
+NOTIFY_CHAT=(os.getenv('INGEST_NOTIFICATION_CHAT_ID','').strip() or os.getenv('OWNER_ID','').strip())
+PROVIDER_RETRIES=max(0,min(5,int(os.getenv('SCRAPER_PROVIDER_RETRIES','2'))))
+PROVIDER_RETRY_DELAY=max(1.0,min(60.0,float(os.getenv('SCRAPER_PROVIDER_RETRY_DELAY_SECONDS','5'))))
+PROVIDER_RETRYABLE_HTTP={401,403,408,425,429,500,502,503,504}
+RUN_CONTEXT={'mode':'','current_page':0,'resume_page':0,'totals':{'archived':0,'skipped':0,'failed':0,'duplicate':0,'pages':0}}
+
+class ProviderUnavailableError(RetrieverError):
+    def __init__(self, provider, url, status, attempts, original):
+        self.provider=provider or 'retriever'
+        self.url=url
+        self.status=status
+        self.attempts=attempts
+        self.original=original
+        status_text=f'HTTP {status}' if status else 'retrieval failure'
+        super().__init__(f'{self.provider} {status_text} after {attempts} attempts while fetching {url}: {original}')
+
+def retriever_http_status(error):
+    m=re.search(r'\bHTTP\s+(\d{3})\b',str(error),re.I)
+    return int(m.group(1)) if m else None
 
 # Browser setup for GitHub Actions / CI
 import undetected_chromedriver as uc
@@ -117,14 +136,29 @@ def get(url, timeout=45):
     if INGEST_FETCH_PROVIDER != "retriever":
         raise RuntimeError("INGEST_FETCH_PROVIDER must be 'retriever' or 'chrome'")
 
-    print(f"[fetch] provider={web_retriever.provider} url={url}")
-    response = web_retriever.raw_fetch(url, timeout=timeout)
-    print(
-        f"[fetch] status={response.status_code} "
-        f"type={response.content_type or 'unknown'} bytes={len(response.content)} "
-        f"time={response.fetch_ms}ms"
-    )
-    return response
+    provider=web_retriever.provider
+    for attempt in range(PROVIDER_RETRIES + 1):
+        print(f"[fetch] provider={provider} url={url}")
+        try:
+            response = web_retriever.raw_fetch(url, timeout=timeout)
+        except RetrieverError as exc:
+            status=retriever_http_status(exc)
+            retryable=status in PROVIDER_RETRYABLE_HTTP
+            if retryable and attempt < PROVIDER_RETRIES:
+                wait=PROVIDER_RETRY_DELAY * (attempt + 1)
+                print(f"[provider] {provider} HTTP {status}; retry {attempt + 1}/{PROVIDER_RETRIES} in {wait:.0f}s")
+                time.sleep(wait)
+                continue
+            if retryable:
+                raise ProviderUnavailableError(provider,url,status,attempt + 1,str(exc)) from exc
+            raise
+        print(
+            f"[fetch] status={response.status_code} "
+            f"type={response.content_type or 'unknown'} bytes={len(response.content)} "
+            f"time={response.fetch_ms}ms"
+        )
+        return response
+    raise ProviderUnavailableError(provider,url,None,PROVIDER_RETRIES + 1,'provider retries exhausted')
 
 def category_from(url):
     p=urlparse(url).path.lower()
@@ -223,6 +257,67 @@ def send_archive_document(it, data, content_type):
         )
     return payload['result']
 
+
+def send_ingest_error_notification(error):
+    if not NOTIFY_CHAT:
+        print('[telegram] INGEST_NOTIFICATION_CHAT_ID/OWNER_ID not set; error alert not sent')
+        return
+    ctx=RUN_CONTEXT
+    totals=ctx.get('totals') or {}
+    current=int(ctx.get('current_page') or 0)
+    resume=int(ctx.get('resume_page') or current or 0)
+    raw=clean(error)
+    if isinstance(error,ProviderUnavailableError):
+        title='🚨 Stick Nodes ingest stopped — retrieval provider'
+        status=f'HTTP {error.status}' if error.status else 'retrieval failure'
+        problem=f'{error.provider} returned {status} repeatedly ({error.attempts} attempts).'
+        action='Check the ScraperAPI dashboard/key/account status, then rerun with start_page=0.' if error.provider=='scraperapi' else 'Check the configured retrieval provider, then rerun with start_page=0.'
+        target=error.url
+    elif isinstance(error,psycopg.Error):
+        title='🚨 Stick Nodes ingest stopped — database'
+        problem='PostgreSQL/database operation failed.'
+        action='Check DATABASE_URL / database availability before rerunning.'
+        target=''
+    elif 'Telegram ' in raw or 'telegram' in raw.lower():
+        title='🚨 Stick Nodes ingest stopped — Telegram'
+        problem=raw
+        action='Check the bot token, archive chat ID, and bot permissions before rerunning.'
+        target=''
+    else:
+        title='🚨 Stick Nodes ingest stopped'
+        problem=raw[:700] or error.__class__.__name__
+        action='Open the GitHub Actions log for the traceback, fix the cause, then rerun.'
+        target=''
+    lines=[
+        title,
+        '',
+        f'Problem: {problem}',
+        f'Page: {current}' if current else '',
+        f'Resume page: {resume}' if resume else '',
+        f'Target: {target}' if target else '',
+        f"Archived this run: {int(totals.get('archived') or 0)}",
+        f"Skipped/duplicates: {int(totals.get('skipped') or 0) + int(totals.get('duplicate') or 0)}",
+        f"Failed files: {int(totals.get('failed') or 0)}",
+        '',
+        'Resume state is preserved; completed pages will not be redownloaded.',
+        f'Action: {action}',
+    ]
+    repo=os.getenv('GITHUB_REPOSITORY','').strip(); run_id=os.getenv('GITHUB_RUN_ID','').strip(); server=os.getenv('GITHUB_SERVER_URL','https://github.com').rstrip('/')
+    if repo and run_id: lines += ['', f'Workflow: {server}/{repo}/actions/runs/{run_id}']
+    message='\n'.join(x for x in lines if x != '')
+    try:
+        resp=telegram_requests.post(
+            f'https://api.telegram.org/bot{TOKEN}/sendMessage',
+            data={'chat_id':NOTIFY_CHAT,'text':message,'disable_web_page_preview':True},
+            timeout=30,
+        )
+        if not resp.ok:
+            print(f'[telegram] error notification failed ({resp.status_code}): {telegram_error_text(resp)}')
+        else:
+            print('[telegram] ingest error notification sent')
+    except Exception as notify_error:
+        print('[telegram] error notification failed:',notify_error)
+
 def process(c,it,p):
     if q(c,'SELECT id FROM stick_archive_files WHERE source_url=%s AND telegram_file_id IS NOT NULL LIMIT 1',(it['source_url'],)): return 'skipped'
     try:
@@ -236,6 +331,8 @@ def process(c,it,p):
         if dup: q(c,'INSERT INTO stick_archive_aliases(source_url,file_id) VALUES(%s,%s) ON CONFLICT(source_url) DO UPDATE SET file_id=EXCLUDED.file_id',(it['source_url'],dup[0]['id'])); c.commit(); return 'duplicate'
         msg=send_archive_document(it, data, r.headers.get('content-type','application/octet-stream')); doc=msg['document']
         q(c,"""INSERT INTO stick_archive_files(source_url,detail_url,source_page,title,normalized_title,original_filename,file_type,category,categories,tags,tags_text,creator,creator_handle,description,source_date,source_hits,pack_count,declared_size_bytes,actual_size_bytes,sha256,telegram_file_id,telegram_file_unique_id,telegram_message_id,archive_chat_id,updated_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW()) ON CONFLICT(source_url) DO UPDATE SET title=EXCLUDED.title,normalized_title=EXCLUDED.normalized_title,original_filename=EXCLUDED.original_filename,file_type=EXCLUDED.file_type,category=EXCLUDED.category,categories=EXCLUDED.categories,tags=EXCLUDED.tags,tags_text=EXCLUDED.tags_text,actual_size_bytes=EXCLUDED.actual_size_bytes,sha256=EXCLUDED.sha256,telegram_file_id=EXCLUDED.telegram_file_id,telegram_file_unique_id=EXCLUDED.telegram_file_unique_id,telegram_message_id=EXCLUDED.telegram_message_id,archive_chat_id=EXCLUDED.archive_chat_id,updated_at=NOW()""",(it['source_url'],it['detail_url'],it['source_page'],it['title'],norm(it['title']),it['original_filename'],it['file_type'],it['category'],it['categories'],it['tags'],' '.join(it['tags']),it['creator'],it['creator_handle'],it['description'],it['source_date'],it['source_hits'],it['pack_count'],it['declared_size_bytes'],it['actual_size_bytes'],it['sha256'],doc['file_id'],doc.get('file_unique_id',''),msg['message_id'],int(CHAT))); q(c,'DELETE FROM stick_archive_failures WHERE source_url=%s',(it['source_url'],)); c.commit(); time.sleep(UPLOAD_DELAY); return 'archived'
+    except ProviderUnavailableError:
+        raise
     except Exception as e: record_fail(c,it,p,e); print('[failed]',it.get('original_filename'),e); return 'failed'
 def scrape(c,p):
     url=page_url(p); print('[scraper] listing page',p,url); items=parse_listing(get(url).text,url); counts={'archived':0,'skipped':0,'failed':0,'duplicate':0}
@@ -243,35 +340,42 @@ def scrape(c,p):
     return items,counts
 
 def main():
-    validate_archive_chat()
     ap=argparse.ArgumentParser(); ap.add_argument('--mode',choices=['backfill','recent','both'],default='backfill'); ap.add_argument('--backfill-pages',type=int,default=25); ap.add_argument('--recent-pages',type=int,default=3); ap.add_argument('--start-page',type=int,default=0); a=ap.parse_args()
+    RUN_CONTEXT['mode']=a.mode
+    validate_archive_chat()
     with conn() as c:
         got=q(c,'SELECT pg_try_advisory_lock(%s) locked',(88442211,))[0]['locked']
         if not got: raise SystemExit('another scraper run already holds the database lock')
         try:
-            st=state(c); totals={'archived':0,'skipped':0,'failed':0,'duplicate':0,'pages':0}; upd(c,status='running',run_started_at=datetime.now(timezone.utc),last_error='')
+            st=state(c); totals={'archived':0,'skipped':0,'failed':0,'duplicate':0,'pages':0}; RUN_CONTEXT['totals']=totals; upd(c,status='running',run_started_at=datetime.now(timezone.utc),last_error='')
             pages=[]
             if a.mode in ('recent','both'): pages += list(range(1,a.recent_pages+1))
             if a.mode in ('backfill','both'):
-                start=a.start_page if a.start_page>0 else max(1,int(st['backfill_next_page'] or 1)); pages += list(range(start,start+a.backfill_pages))
+                start=a.start_page if a.start_page>0 else max(1,int(st['backfill_next_page'] or 1)); RUN_CONTEXT['resume_page']=start; pages += list(range(start,start+a.backfill_pages))
             seen=set()
             for p in pages:
                 if p in seen: continue
-                seen.add(p); upd(c,current_page=p,heartbeat_at=datetime.now(timezone.utc)); items,ct=scrape(c,p)
+                seen.add(p); RUN_CONTEXT['current_page']=p; RUN_CONTEXT['resume_page']=p; upd(c,current_page=p,heartbeat_at=datetime.now(timezone.utc)); items,ct=scrape(c,p)
                 if not items and a.mode in ('backfill','both'):
                     if p == 1:
                         raise RuntimeError('listing page 1 returned zero archive items; refusing to mark backfill complete')
                     upd(c,backfill_complete=True,current_page=p); break
                 for k in ct: totals[k]+=ct[k]
                 totals['pages']+=1
-                if a.mode in ('backfill','both') and p>= (a.start_page if a.start_page>0 else int(st['backfill_next_page'] or 1)): upd(c,backfill_next_page=p+1)
+                if a.mode in ('backfill','both') and p>= (a.start_page if a.start_page>0 else int(st['backfill_next_page'] or 1)):
+                    upd(c,backfill_next_page=p+1); RUN_CONTEXT['resume_page']=p+1
                 upd(c,pages_completed_latest=totals['pages'],archived_latest=totals['archived'],skipped_latest=totals['skipped']+totals['duplicate'],failed_latest=totals['failed'],last_success_at=datetime.now(timezone.utc),heartbeat_at=datetime.now(timezone.utc))
             upd(c,status='waiting',run_finished_at=datetime.now(timezone.utc),last_error=''); print('[done]',totals)
-        except Exception as e: upd(c,status='stalled',run_finished_at=datetime.now(timezone.utc),last_error=str(e)[:1000]); raise
+        except Exception as e:
+            upd(c,status='stalled',run_finished_at=datetime.now(timezone.utc),last_error=str(e)[:1000]); raise
         finally: q(c,'SELECT pg_advisory_unlock(%s)',(88442211,)); c.commit()
+
 if __name__=='__main__':
     try:
         main()
+    except Exception as error:
+        send_ingest_error_notification(error)
+        raise
     finally:
         if web_retriever is not None:
             web_retriever.close()
