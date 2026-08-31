@@ -49,6 +49,7 @@ def retriever_http_status(error):
 
 # Browser setup for GitHub Actions / CI
 import undetected_chromedriver as uc
+from playwright.sync_api import sync_playwright
 
 class CustomSession:
     def __init__(self):
@@ -57,28 +58,83 @@ class CustomSession:
         self.options.add_argument("--no-sandbox")
         self.options.add_argument("--disable-dev-shm-usage")
         self.options.add_argument("--window-size=1280,720")
+        self.options.add_argument("--disable-blink-features=AutomationControlled")
 
         try:
-            sys.stdout.write("[init] Starting Chrome...\n")
-            self._driver = uc.Chrome(options=self.options, version_main=151)
+            sys.stdout.write("[init] Starting Undetected Chrome...\n")
+            self._driver = uc.Chrome(options=self.options)
             self._driver.set_page_load_timeout(45)
             time.sleep(0.5)
             return
         except Exception as e:
-            print(f"[Error] Browser init failed: {e}")
+            print(f"[browser] Undetected Chrome init failed: {e}")
             raise
 
     def close(self):
         if hasattr(self, "_driver"):
             self._driver.quit()
 
+class PlaywrightStealthSession:
+    def __init__(self):
+        print('[init] Starting Playwright Chromium stealth fallback...')
+        self._pw = sync_playwright().start()
+        self._browser = self._pw.chromium.launch(
+            headless=True,
+            args=[
+                '--no-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-blink-features=AutomationControlled',
+            ],
+        )
+        self._context = self._browser.new_context(
+            user_agent=UA,
+            viewport={'width': 1280, 'height': 720},
+            locale='en-US',
+            timezone_id='Africa/Lagos',
+        )
+        self._context.add_init_script('''
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+            window.chrome = window.chrome || { runtime: {} };
+        ''')
+        self._page = self._context.new_page()
+
+    def get_html(self, url, timeout=45):
+        self._page.goto(url, wait_until='domcontentloaded', timeout=int(timeout * 1000))
+        self._page.wait_for_timeout(1500)
+        try:
+            self._page.wait_for_function(
+                "!document.title.includes('Just a moment')",
+                timeout=min(30000, int(timeout * 1000)),
+            )
+        except Exception:
+            pass
+        return self._page.title(), self._page.url, self._page.content()
+
+    def close(self):
+        try:
+            self._context.close()
+        finally:
+            try:
+                self._browser.close()
+            finally:
+                self._pw.stop()
+
 _chrome_session = None
+_playwright_session = None
 
 def chrome_session():
     global _chrome_session
     if _chrome_session is None:
         _chrome_session = CustomSession()
     return _chrome_session
+
+def playwright_session():
+    global _playwright_session
+    if _playwright_session is None:
+        _playwright_session = PlaywrightStealthSession()
+    return _playwright_session
 
 INGEST_FETCH_PROVIDER = os.getenv("INGEST_FETCH_PROVIDER", "retriever").strip().lower()
 web_retriever = Retriever() if INGEST_FETCH_PROVIDER == "retriever" else None
@@ -97,40 +153,131 @@ def norm(x): return clean(x).lower()
 def tags(title,cat,typ): return list(dict.fromkeys(re.findall(r'[a-z0-9]+',norm(title))+[cat,typ]))
 def page_url(n): return LIST + ('&' if '?' in LIST else '?') + f'wpfb_list_page={max(1,n)}'
 
+class BrowserResponse:
+    status_code = 200
+    def __init__(self, text='', content=None, headers=None, url=''):
+        self.text = text if text is not None else ''
+        self._content = content
+        self.headers = headers or {"content-type": "text/html; charset=utf-8"}
+        self.url = url
+    @property
+    def content(self):
+        if self._content is not None:
+            return self._content
+        return self.text.encode("utf-8", errors="replace")
+    def raise_for_status(self): return None
+
+def looks_like_browser_challenge(title, text):
+    sample=(str(title or '') + '\n' + str(text or '')[:200000]).lower()
+    markers=(
+        'just a moment',
+        'cf-browser-verification',
+        'challenges.cloudflare.com',
+        'verify you are human',
+    )
+    return any(marker in sample for marker in markers)
+
+def playwright_get(url, timeout=45):
+    s=playwright_session()
+    print(f"[fetch] provider=playwright-stealth url={url}")
+    title,current_url,text=s.get_html(url,timeout)
+    print('[debug] PLAYWRIGHT TITLE:',title)
+    print('[debug] PLAYWRIGHT URL:',current_url)
+    print('[debug] PLAYWRIGHT HTML LENGTH:',len(text))
+    if looks_like_browser_challenge(title,text):
+        raise RuntimeError('Playwright still received a browser verification/challenge page')
+    return BrowserResponse(text=text,url=current_url)
+
 def chrome_get(url, timeout=45):
-    s = chrome_session()
+    try:
+        s=chrome_session()
+    except Exception as chrome_init_error:
+        print(f"[browser] Undetected Chrome unavailable; trying Playwright stealth: {chrome_init_error}")
+        return playwright_get(url,timeout)
+
     last=None
     for i in range(4):
         try:
             s._driver.execute_cdp_cmd("Network.enable", {})
             s._driver.get(url)
+            title=s._driver.title
+            current_url=s._driver.current_url
+            text_content=s._driver.page_source
 
-            print("[debug] PAGE TITLE:", s._driver.title)
-            print("[debug] CURRENT URL:", s._driver.current_url)
-            print("[debug] HTML LENGTH:", len(s._driver.page_source))
-            print("[debug] PAGE PREVIEW:", s._driver.page_source[:500].replace("\n", " "))
+            print("[debug] PAGE TITLE:", title)
+            print("[debug] CURRENT URL:", current_url)
+            print("[debug] HTML LENGTH:", len(text_content))
+            print("[debug] PAGE PREVIEW:", text_content[:500].replace("\n", " "))
 
-            time.sleep(max(0.1, float(os.getenv('SCRAPER_SITE_DELAY_MS','350'))/1000))
-            text_content = s._driver.page_source
+            if looks_like_browser_challenge(title,text_content):
+                print('[browser] Undetected Chrome received a challenge; switching to Playwright stealth')
+                return playwright_get(url,timeout)
 
-            class BrowserResponse:
-                status_code = 200
-                headers = {"content-type": "text/html; charset=utf-8"}
-                def __init__(self, text): self.text = text
-                @property
-                def content(self): return self.text.encode("utf-8", errors="replace")
-                def raise_for_status(self): return None
-
-            return BrowserResponse(text_content)
+            time.sleep(DELAY)
+            return BrowserResponse(text=text_content,url=current_url)
         except Exception as e:
             last=e
+            print(f"[browser] Undetected Chrome attempt {i + 1}/4 failed: {e}")
             if i < 3:
                 time.sleep(i+1)
-    raise last or RuntimeError("Browser session failed after retries")
 
-def get(url, timeout=45):
+    print('[browser] Undetected Chrome exhausted retries; switching to Playwright stealth')
+    try:
+        return playwright_get(url,timeout)
+    except Exception as playwright_error:
+        raise RuntimeError(f'Both browser fetchers failed. Chrome: {last}; Playwright: {playwright_error}') from playwright_error
+
+def browser_download(url, timeout=60):
+    cookies={}
+    referer=LIST
+    try:
+        s=chrome_session()
+        cookies={c['name']:c['value'] for c in s._driver.get_cookies()}
+        referer=s._driver.current_url or LIST
+    except Exception:
+        pass
+
+    if _playwright_session is not None:
+        try:
+            cookies.update({c['name']:c['value'] for c in _playwright_session._context.cookies()})
+            referer=_playwright_session._page.url or referer
+        except Exception:
+            pass
+
+    print(f"[fetch] provider=direct-browser-session file={url}")
+    response=http_requests.get(
+        url,
+        headers={'User-Agent':UA,'Referer':referer,'Accept':'*/*'},
+        cookies=cookies,
+        timeout=timeout,
+        allow_redirects=True,
+        impersonate='chrome',
+    )
+    if response.status_code < 400:
+        return response
+
+    if _playwright_session is not None:
+        print(f"[download] direct browser-session HTTP {response.status_code}; trying Playwright context request")
+        api_response=_playwright_session._context.request.get(
+            url,
+            headers={'Referer':referer,'Accept':'*/*'},
+            timeout=int(timeout * 1000),
+        )
+        if api_response.status < 400:
+            return BrowserResponse(
+                content=api_response.body(),
+                headers=dict(api_response.headers),
+                url=api_response.url,
+            )
+        raise RuntimeError(f'HTTP {api_response.status} while downloading {url} through Playwright context')
+
+    raise RuntimeError(f'HTTP {response.status_code} while downloading {url}')
+
+def get(url, timeout=45, binary=False):
     if INGEST_FETCH_PROVIDER == "chrome":
-        print(f"[fetch] provider=chrome url={url}")
+        if binary:
+            return browser_download(url,timeout)
+        print(f"[fetch] provider=undetected-chrome url={url}")
         return chrome_get(url, timeout)
 
     if INGEST_FETCH_PROVIDER != "retriever":
@@ -321,7 +468,7 @@ def send_ingest_error_notification(error):
 def process(c,it,p):
     if q(c,'SELECT id FROM stick_archive_files WHERE source_url=%s AND telegram_file_id IS NOT NULL LIMIT 1',(it['source_url'],)): return 'skipped'
     try:
-        it=hydrate(it); time.sleep(DELAY); r=get(it['download_url'],60); data=r.content
+        it=hydrate(it); time.sleep(DELAY); r=get(it['download_url'],60,binary=True); data=r.content
         content_type=str(r.headers.get('content-type','')).lower()
         if 'text/html' in content_type or data[:128].lstrip().lower().startswith((b'<!doctype html', b'<html')):
             raise RuntimeError('download URL returned HTML instead of the original asset bytes; refusing to archive it')
@@ -381,3 +528,5 @@ if __name__=='__main__':
             web_retriever.close()
         if _chrome_session is not None:
             _chrome_session.close()
+        if _playwright_session is not None:
+            _playwright_session.close()
