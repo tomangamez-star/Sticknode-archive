@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import argparse, hashlib, html, os, re, sys, time
+import argparse, hashlib, html, os, re, sys, time, shutil, subprocess
 from pathlib import Path
 from datetime import datetime, timezone
 from urllib.parse import urljoin, urlparse, unquote
@@ -51,6 +51,34 @@ def retriever_http_status(error):
 import undetected_chromedriver as uc
 from playwright.sync_api import sync_playwright
 
+def detect_chrome_major():
+    candidates = (
+        'google-chrome',
+        'google-chrome-stable',
+        'chromium',
+        'chromium-browser',
+    )
+    for name in candidates:
+        executable = shutil.which(name)
+        if not executable:
+            continue
+        try:
+            output = subprocess.check_output(
+                [executable, '--version'],
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=10,
+            ).strip()
+            match = re.search(r'(\d+)\.', output)
+            if match:
+                major = int(match.group(1))
+                print(f'[init] Detected Chrome major {major}: {output}')
+                return major
+        except Exception as error:
+            print(f'[init] Could not read Chrome version from {executable}: {error}')
+    print('[init] Chrome major version could not be detected; letting undetected-chromedriver auto-select')
+    return None
+
 class CustomSession:
     def __init__(self):
         self.options = uc.ChromeOptions()
@@ -61,8 +89,13 @@ class CustomSession:
         self.options.add_argument("--disable-blink-features=AutomationControlled")
 
         try:
-            sys.stdout.write("[init] Starting Undetected Chrome...\n")
-            self._driver = uc.Chrome(options=self.options)
+            chrome_major = detect_chrome_major()
+            if chrome_major:
+                sys.stdout.write(f"[init] Starting Undetected Chrome with ChromeDriver major {chrome_major}...\n")
+                self._driver = uc.Chrome(options=self.options, version_main=chrome_major)
+            else:
+                sys.stdout.write("[init] Starting Undetected Chrome with automatic driver selection...\n")
+                self._driver = uc.Chrome(options=self.options)
             self._driver.set_page_load_timeout(45)
             time.sleep(0.5)
             return
