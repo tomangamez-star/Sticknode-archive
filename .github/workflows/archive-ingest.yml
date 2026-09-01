@@ -24,6 +24,11 @@ on:
         required: true
         default: '0'
         type: string
+      exit_test_only:
+        description: Only test StickNodes through the phone exit node
+        required: true
+        default: true
+        type: boolean
 
 permissions:
   contents: read
@@ -42,6 +47,7 @@ jobs:
       ARCHIVE_CHAT_ID: ${{ secrets.ARCHIVE_CHAT_ID }}
       OWNER_ID: ${{ secrets.OWNER_ID }}
       INGEST_NOTIFICATION_CHAT_ID: ${{ secrets.INGEST_NOTIFICATION_CHAT_ID }}
+      TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
       STICKNODES_BASE_URL: https://sticknodes.com
       STICKNODES_LIST_URL: https://sticknodes.com/stickfigures/
       SCRAPER_SITE_DELAY_MS: '350'
@@ -58,19 +64,102 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
       - name: Set up Python
+        if: ${{ !inputs.exit_test_only }}
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: pip
+
       - name: Install Python dependencies
+        if: ${{ !inputs.exit_test_only }}
         run: pip install -r requirements.txt
+
       - name: Install Playwright Chromium
+        if: ${{ !inputs.exit_test_only }}
         run: python -m playwright install --with-deps chromium
+
+      - name: Show GitHub runner public IP before Tailscale
+        run: |
+          echo "Direct GitHub runner public IP:"
+          curl -fsS --max-time 20 https://api.ipify.org
+          echo
+
+      - name: Install Tailscale
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+
+      - name: Connect GitHub runner through Tecno exit node
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -z "${TAILSCALE_AUTHKEY:-}" ]; then
+            echo "::error::Missing GitHub Actions secret TAILSCALE_AUTHKEY"
+            exit 1
+          fi
+
+          sudo tailscale up \
+            --auth-key="$TAILSCALE_AUTHKEY" \
+            --hostname="sticknode-github-test" \
+            --exit-node="tecno-spark-30c"
+
+          echo
+          echo "Tailscale status:"
+          tailscale status
+
+      - name: Verify phone exit and test one StickNodes file
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Public IP after selecting tecno-spark-30c:"
+          EXIT_IP="$(curl -fsS --max-time 30 https://api.ipify.org)"
+          echo "$EXIT_IP"
+          echo
+
+          TEST_URL="https://sticknodes.com/download/people/Lynn-Loud-Dad-Lincoln-Loud.nodes"
+          TEST_FILE="/tmp/sticknodes-exit-test.nodes"
+          UA="Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/151 Mobile Safari/537.36"
+
+          echo "Testing one small StickNodes download through the phone..."
+          HTTP_CODE="$(curl -L \
+            --max-time 60 \
+            --connect-timeout 20 \
+            --retry 1 \
+            -A "$UA" \
+            -o "$TEST_FILE" \
+            -sS \
+            -w '%{http_code}' \
+            "$TEST_URL")"
+
+          BYTES="$(wc -c < "$TEST_FILE" | tr -d ' ')"
+
+          echo "StickNodes HTTP status: $HTTP_CODE"
+          echo "Downloaded bytes: $BYTES"
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "::error::StickNodes did not return HTTP 200 through the phone exit node."
+            exit 1
+          fi
+
+          if [ "$BYTES" -lt 1000 ]; then
+            echo "::error::Response was unexpectedly small; refusing to count it as a successful file download."
+            exit 1
+          fi
+
+          echo "SUCCESS: GitHub downloaded a real StickNodes file through tecno-spark-30c."
+
       - name: Run Python ingestion
+        if: ${{ !inputs.exit_test_only }}
         run: >-
           python python_ingest/ingest.py
           --mode=${{ inputs.mode }}
           --backfill-pages=${{ inputs.backfill_pages }}
           --recent-pages=${{ inputs.recent_pages }}
           --start-page=${{ inputs.start_page }}
+
+      - name: Disconnect Tailscale
+        if: ${{ always() }}
+        run: sudo tailscale logout || true
