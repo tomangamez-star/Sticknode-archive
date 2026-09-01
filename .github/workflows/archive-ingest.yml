@@ -100,10 +100,45 @@ jobs:
             exit 1
           fi
 
+          echo "Joining Tailscale first..."
           sudo tailscale up \
             --auth-key="$TAILSCALE_AUTHKEY" \
-            --hostname="sticknode-github-test" \
-            --exit-node="tecno-spark-30c"
+            --hostname="sticknode-github-test"
+
+          echo "Waiting for tecno-spark-30c to appear in the tailnet..."
+          PHONE_IP=""
+          for i in $(seq 1 30); do
+            PHONE_IP="$(tailscale status --json | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+for peer in data.get("Peer", {}).values():
+    dns = (peer.get("DNSName") or "").rstrip(".")
+    host = peer.get("HostName") or ""
+    if host == "tecno-spark-30c" or dns.startswith("tecno-spark-30c."):
+        ips = peer.get("TailscaleIPs") or []
+        if ips:
+            print(ips[0])
+            break
+' || true)"
+
+            if [ -n "$PHONE_IP" ]; then
+              break
+            fi
+
+            sleep 2
+          done
+
+          if [ -z "$PHONE_IP" ]; then
+            echo "::error::Could not find tecno-spark-30c on the tailnet after 60 seconds."
+            echo "Current Tailscale status:"
+            tailscale status || true
+            exit 1
+          fi
+
+          echo "Found Tecno Tailscale IP: $PHONE_IP"
+          echo "Selecting it as the exit node..."
+
+          sudo tailscale set --exit-node="$PHONE_IP"
 
           echo
           echo "Tailscale status:"
