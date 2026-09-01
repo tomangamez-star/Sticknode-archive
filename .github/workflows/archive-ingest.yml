@@ -27,7 +27,7 @@ on:
       exit_test_only:
         description: Only test StickNodes through the phone exit node
         required: true
-        default: true
+        default: false
         type: boolean
 
 permissions:
@@ -133,7 +133,7 @@ jobs:
           echo "Tailscale status:"
           tailscale status
 
-      - name: Verify phone exit and test one StickNodes file
+      - name: Verify phone exit and StickNodes access
         shell: bash
         run: |
           set -euo pipefail
@@ -177,13 +177,13 @@ jobs:
 
       - name: Run Python ingestion
         if: ${{ !inputs.exit_test_only }}
-        run: >-
-          python python_ingest/ingest.py
-          --mode=${{ inputs.mode }}
-          --backfill-pages=${{ inputs.backfill_pages }}
-          --recent-pages=${{ inputs.recent_pages }}
-          --start-page=${{ inputs.start_page }}
-
+        run: |
+          echo "Starting real archive ingestion through the Tecno exit node..."
+          python python_ingest/ingest.py \
+            --mode=${{ inputs.mode }} \
+            --backfill-pages=${{ inputs.backfill_pages }} \
+            --recent-pages=${{ inputs.recent_pages }} \
+            --start-page=${{ inputs.start_page }}
       - name: Disconnect Tailscale
         if: ${{ always() }}
         run: sudo tailscale logout || true
