@@ -107,16 +107,15 @@ class CustomSession:
         if hasattr(self, "_driver"):
             self._driver.quit()
 
-class PlaywrightStealthSession:
+class PlaywrightBrowserSession:
     def __init__(self):
-        print('[init] Starting Playwright Chromium stealth fallback...')
+        print('[init] Starting Playwright Chromium browser session...')
         self._pw = sync_playwright().start()
         self._browser = self._pw.chromium.launch(
             headless=True,
             args=[
                 '--no-sandbox',
                 '--disable-dev-shm-usage',
-                '--disable-blink-features=AutomationControlled',
             ],
         )
         self._context = self._browser.new_context(
@@ -125,12 +124,6 @@ class PlaywrightStealthSession:
             locale='en-US',
             timezone_id='Africa/Lagos',
         )
-        self._context.add_init_script('''
-            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-            Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
-            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
-            window.chrome = window.chrome || { runtime: {} };
-        ''')
         self._page = self._context.new_page()
 
     def get_html(self, url, timeout=45):
@@ -144,6 +137,43 @@ class PlaywrightStealthSession:
         except Exception:
             pass
         return self._page.title(), self._page.url, self._page.content()
+
+    def download_from_listing(self, url, source_page, timeout=60):
+        # Keep the download inside the same real browser context that loaded the listing.
+        # If another page changed the tab, restore the item's source listing first.
+        if source_page and self._page.url != source_page:
+            title,current_url,text=self.get_html(source_page, min(timeout,45))
+            if looks_like_browser_challenge(title,text):
+                raise RuntimeError('Playwright received a browser verification/challenge page while restoring the listing')
+
+        target=None
+        for link in self._page.locator('a[href*="/download/"]').all():
+            href=link.get_attribute('href')
+            if href and urljoin(self._page.url,href) == url:
+                target=link
+                break
+        if target is None:
+            raise RuntimeError(f'download link is not present on the live listing page: {url}')
+
+        print(f'[download] clicking live Playwright link file={url}')
+        with self._page.expect_download(timeout=int(timeout * 1000)) as event:
+            target.click(timeout=int(timeout * 1000))
+        download=event.value
+        failure=download.failure()
+        if failure:
+            raise RuntimeError(f'Playwright browser download failed: {failure}')
+        path=download.path()
+        if not path:
+            raise RuntimeError('Playwright browser download completed without a readable file path')
+        data=Path(path).read_bytes()
+        return BrowserResponse(
+            content=data,
+            headers={
+                'content-type':'application/octet-stream',
+                'content-disposition':f'attachment; filename="{download.suggested_filename}"',
+            },
+            url=url,
+        )
 
     def close(self):
         try:
@@ -166,7 +196,7 @@ def chrome_session():
 def playwright_session():
     global _playwright_session
     if _playwright_session is None:
-        _playwright_session = PlaywrightStealthSession()
+        _playwright_session = PlaywrightBrowserSession()
     return _playwright_session
 
 INGEST_FETCH_PROVIDER = os.getenv("INGEST_FETCH_PROVIDER", "retriever").strip().lower()
@@ -212,7 +242,7 @@ def looks_like_browser_challenge(title, text):
 
 def playwright_get(url, timeout=45):
     s=playwright_session()
-    print(f"[fetch] provider=playwright-stealth url={url}")
+    print(f"[fetch] provider=playwright-browser url={url}")
     title,current_url,text=s.get_html(url,timeout)
     print('[debug] PLAYWRIGHT TITLE:',title)
     print('[debug] PLAYWRIGHT URL:',current_url)
@@ -260,61 +290,25 @@ def chrome_get(url, timeout=45):
     except Exception as playwright_error:
         raise RuntimeError(f'Both browser fetchers failed. Chrome: {last}; Playwright: {playwright_error}') from playwright_error
 
-def browser_download(url, timeout=60):
-    cookies={}
-    referer=LIST
-    try:
-        s=chrome_session()
-        cookies={c['name']:c['value'] for c in s._driver.get_cookies()}
-        referer=s._driver.current_url or LIST
-    except Exception:
-        pass
+def playwright_browser_download(url, source_page='', timeout=60):
+    s=playwright_session()
+    print(f'[fetch] provider=playwright-browser-download file={url}')
+    return s.download_from_listing(url, source_page, timeout)
 
-    if _playwright_session is not None:
-        try:
-            cookies.update({c['name']:c['value'] for c in _playwright_session._context.cookies()})
-            referer=_playwright_session._page.url or referer
-        except Exception:
-            pass
+def get(url, timeout=45, binary=False, source_page=''):
+    if INGEST_FETCH_PROVIDER == "playwright":
+        if binary:
+            return playwright_browser_download(url,source_page,timeout)
+        return playwright_get(url, timeout)
 
-    print(f"[fetch] provider=direct-browser-session file={url}")
-    response=http_requests.get(
-        url,
-        headers={'User-Agent':UA,'Referer':referer,'Accept':'*/*'},
-        cookies=cookies,
-        timeout=timeout,
-        allow_redirects=True,
-        impersonate='chrome',
-    )
-    if response.status_code < 400:
-        return response
-
-    if _playwright_session is not None:
-        print(f"[download] direct browser-session HTTP {response.status_code}; trying Playwright context request")
-        api_response=_playwright_session._context.request.get(
-            url,
-            headers={'Referer':referer,'Accept':'*/*'},
-            timeout=int(timeout * 1000),
-        )
-        if api_response.status < 400:
-            return BrowserResponse(
-                content=api_response.body(),
-                headers=dict(api_response.headers),
-                url=api_response.url,
-            )
-        raise RuntimeError(f'HTTP {api_response.status} while downloading {url} through Playwright context')
-
-    raise RuntimeError(f'HTTP {response.status_code} while downloading {url}')
-
-def get(url, timeout=45, binary=False):
     if INGEST_FETCH_PROVIDER == "chrome":
         if binary:
-            return browser_download(url,timeout)
+            raise RuntimeError('Chrome binary download path is disabled in this test; use INGEST_FETCH_PROVIDER=playwright')
         print(f"[fetch] provider=undetected-chrome url={url}")
         return chrome_get(url, timeout)
 
     if INGEST_FETCH_PROVIDER != "retriever":
-        raise RuntimeError("INGEST_FETCH_PROVIDER must be 'retriever' or 'chrome'")
+        raise RuntimeError("INGEST_FETCH_PROVIDER must be 'retriever', 'chrome', or 'playwright'")
 
     provider=web_retriever.provider
     for attempt in range(PROVIDER_RETRIES + 1):
@@ -501,7 +495,7 @@ def send_ingest_error_notification(error):
 def process(c,it,p):
     if q(c,'SELECT id FROM stick_archive_files WHERE source_url=%s AND telegram_file_id IS NOT NULL LIMIT 1',(it['source_url'],)): return 'skipped'
     try:
-        it=hydrate(it); time.sleep(DELAY); r=get(it['download_url'],60,binary=True); data=r.content
+        it=hydrate(it); time.sleep(DELAY); r=get(it['download_url'],60,binary=True,source_page=it.get('source_page','')); data=r.content
         content_type=str(r.headers.get('content-type','')).lower()
         if 'text/html' in content_type or data[:128].lstrip().lower().startswith((b'<!doctype html', b'<html')):
             raise RuntimeError('download URL returned HTML instead of the original asset bytes; refusing to archive it')
