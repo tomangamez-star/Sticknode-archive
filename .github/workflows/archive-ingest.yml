@@ -51,12 +51,13 @@ jobs:
       STICKNODES_BASE_URL: https://sticknodes.com
       STICKNODES_LIST_URL: https://sticknodes.com/stickfigures/
       SCRAPER_SITE_DELAY_MS: '350'
-      SCRAPER_UPLOAD_DELAY_MS: '1100'
+      SCRAPER_UPLOAD_DELAY_MS: '650'
       SCRAPER_MAX_FILE_MB: '45'
       SCRAPER_FETCH_DETAILS: 'false'
       SCRAPER_PROVIDER_RETRIES: '2'
       SCRAPER_PROVIDER_RETRY_DELAY_SECONDS: '5'
-      INGEST_FETCH_PROVIDER: playwright
+      INGEST_FETCH_PROVIDER: retriever
+      RETRIEVER_PROVIDER: direct
       RETRIEVER_ALLOWED_HOSTS: sticknodes.com
       RETRIEVER_RESPECT_ROBOTS: 'true'
       RETRIEVER_TIMEOUT_SECONDS: '60'
@@ -76,9 +77,56 @@ jobs:
         if: ${{ !inputs.exit_test_only }}
         run: pip install -r requirements.txt
 
-      - name: Install Playwright Chromium
+
+      - name: Apply archive schema migration
         if: ${{ !inputs.exit_test_only }}
-        run: python -m playwright install --with-deps chromium
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import psycopg
+          db = os.environ['DATABASE_URL'].strip()
+          sslmode = 'prefer' if ('localhost' in db or '127.0.0.1' in db) else 'require'
+          sql = Path('migrations/003_other_and_access.sql').read_text()
+          with psycopg.connect(db, sslmode=sslmode) as conn:
+              with conn.cursor() as cur:
+                  cur.execute(sql)
+              conn.commit()
+          print('[migration] other file type + bot access settings ready')
+          PY
+
+      - name: Register archive run telemetry
+        if: ${{ !inputs.exit_test_only }}
+        shell: bash
+        env:
+          RUN_MODE: ${{ inputs.mode }}
+          BACKFILL_PAGES: ${{ inputs.backfill_pages }}
+          RECENT_PAGES: ${{ inputs.recent_pages }}
+        run: |
+          python - <<'PY'
+          import os
+          import psycopg
+
+          mode = os.environ['RUN_MODE']
+          backfill = max(0, int(os.environ['BACKFILL_PAGES']))
+          recent = max(0, int(os.environ['RECENT_PAGES']))
+          target = backfill if mode == 'backfill' else recent if mode == 'recent' else backfill + recent
+          run_id = f"gh:{os.environ.get('GITHUB_RUN_ID','unknown')}:{mode}:{target}"
+          db = os.environ['DATABASE_URL'].strip()
+          sslmode = 'prefer' if ('localhost' in db or '127.0.0.1' in db) else 'require'
+          with psycopg.connect(db, sslmode=sslmode) as conn:
+              with conn.cursor() as cur:
+                  cur.execute("""
+                      UPDATE stick_archive_scraper_state
+                      SET run_id=%s, status='preparing', current_page=0, pages_completed_latest=0,
+                          archived_latest=0, skipped_latest=0, failed_latest=0, last_error='',
+                          heartbeat_at=NOW(), run_finished_at=NULL, updated_at=NOW()
+                      WHERE state_key='main'
+                  """, (run_id,))
+              conn.commit()
+          print(f'[telemetry] registered {run_id}')
+          PY
 
       - name: Show GitHub runner public IP before Tailscale
         run: |
@@ -179,7 +227,7 @@ jobs:
         if: ${{ !inputs.exit_test_only }}
         run: |
           echo "Starting real archive ingestion through the Tecno exit node..."
-          python python_ingest/ingest.py \
+          python python_ingest/fast_ingest.py \
             --mode=${{ inputs.mode }} \
             --backfill-pages=${{ inputs.backfill_pages }} \
             --recent-pages=${{ inputs.recent_pages }} \
@@ -187,3 +235,48 @@ jobs:
       - name: Disconnect Tailscale
         if: ${{ always() }}
         run: sudo tailscale logout || true
+
+      - name: Notify successful archive run
+        if: ${{ success() && !inputs.exit_test_only }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          from datetime import datetime, timezone
+          import psycopg
+          import requests
+
+          db = os.environ['DATABASE_URL'].strip()
+          sslmode = 'prefer' if ('localhost' in db or '127.0.0.1' in db) else 'require'
+          with psycopg.connect(db, sslmode=sslmode) as conn:
+              with conn.cursor() as cur:
+                  cur.execute("""
+                      SELECT pages_completed_latest, archived_latest, skipped_latest, failed_latest,
+                             backfill_next_page, run_started_at, run_finished_at, run_id
+                      FROM stick_archive_scraper_state WHERE state_key='main'
+                  """)
+                  row = cur.fetchone()
+          pages, archived, skipped, failed, next_page, started, finished, run_id = row
+          elapsed = max(0, ((finished or datetime.now(timezone.utc)) - started).total_seconds()) if started else 0
+          avg = elapsed / pages if pages else 0
+          mins = int(elapsed // 60)
+          avg_text = f'{int(avg//60)}m {int(avg%60)}s' if avg else 'n/a'
+          text = (
+              '✅ Stick Nodes archive run finished\n\n'
+              f'Pages completed: {pages}\n'
+              f'Archived: {archived}\n'
+              f'Skipped/duplicates: {skipped}\n'
+              f'Failed: {failed}\n'
+              f'Average/page: {avg_text}\n'
+              f'Run time: {mins}m\n'
+              f'Next backfill page: {next_page}'
+          )
+          token = os.environ.get('TELEGRAM_TOKEN','').strip()
+          chat = (os.environ.get('INGEST_NOTIFICATION_CHAT_ID','').strip() or os.environ.get('OWNER_ID','').strip())
+          if token and chat:
+              r = requests.post(f'https://api.telegram.org/bot{token}/sendMessage', data={'chat_id':chat,'text':text}, timeout=30)
+              r.raise_for_status()
+              print('[telegram] completion notification sent')
+          else:
+              print('[telegram] completion notification skipped: notification chat/token missing')
+          PY
