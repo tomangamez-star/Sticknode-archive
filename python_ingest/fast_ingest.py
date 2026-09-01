@@ -4,7 +4,7 @@ import re
 import time
 from urllib.parse import urljoin
 from bs4 import BeautifulSoup
-from python_ingest import ingest as core
+import ingest as core
 
 KNOWN_NODE_EXTS = ('.nodes', '.stk')
 KNOWN_MOVIE_EXTS = ('.nodemc',)
