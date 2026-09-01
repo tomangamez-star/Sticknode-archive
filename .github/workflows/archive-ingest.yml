@@ -108,18 +108,7 @@ jobs:
           echo "Waiting for tecno-spark-30c to appear in the tailnet..."
           PHONE_IP=""
           for i in $(seq 1 30); do
-            PHONE_IP="$(tailscale status --json | python3 -c '
-import json, sys
-data = json.load(sys.stdin)
-for peer in data.get("Peer", {}).values():
-    dns = (peer.get("DNSName") or "").rstrip(".")
-    host = peer.get("HostName") or ""
-    if host == "tecno-spark-30c" or dns.startswith("tecno-spark-30c."):
-        ips = peer.get("TailscaleIPs") or []
-        if ips:
-            print(ips[0])
-            break
-' || true)"
+            PHONE_IP="$(tailscale status --json | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next((p.get("TailscaleIPs", [""])[0] for p in d.get("Peer", {}).values() if (p.get("HostName") == "tecno-spark-30c" or (p.get("DNSName") or "").rstrip(".").startswith("tecno-spark-30c.")) and p.get("TailscaleIPs")), ""))' || true)"
 
             if [ -n "$PHONE_IP" ]; then
               break
