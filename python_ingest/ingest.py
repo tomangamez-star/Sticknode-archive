@@ -139,8 +139,8 @@ class PlaywrightBrowserSession:
         return self._page.title(), self._page.url, self._page.content()
 
     def download_from_listing(self, url, source_page, timeout=60):
-        # Keep the download inside the same real browser context that loaded the listing.
-        # If another page changed the tab, restore the item's source listing first.
+        # Diagnostic browser-click path: click the exact live title anchor and
+        # record what the site actually does instead of manufacturing a request.
         if source_page and self._page.url != source_page:
             title,current_url,text=self.get_html(source_page, min(timeout,45))
             if looks_like_browser_challenge(title,text):
@@ -155,25 +155,113 @@ class PlaywrightBrowserSession:
         if target is None:
             raise RuntimeError(f'download link is not present on the live listing page: {url}')
 
-        print(f'[download] clicking live Playwright link file={url}')
-        with self._page.expect_download(timeout=int(timeout * 1000)) as event:
-            target.click(timeout=int(timeout * 1000))
-        download=event.value
-        failure=download.failure()
-        if failure:
-            raise RuntimeError(f'Playwright browser download failed: {failure}')
-        path=download.path()
-        if not path:
-            raise RuntimeError('Playwright browser download completed without a readable file path')
-        data=Path(path).read_bytes()
-        return BrowserResponse(
-            content=data,
-            headers={
-                'content-type':'application/octet-stream',
-                'content-disposition':f'attachment; filename="{download.suggested_filename}"',
-            },
-            url=url,
-        )
+        info=target.evaluate("""el => ({
+            text: (el.innerText || el.textContent || '').trim(),
+            hrefAttr: el.getAttribute('href'),
+            hrefResolved: el.href,
+            target: el.getAttribute('target'),
+            rel: el.getAttribute('rel'),
+            download: el.getAttribute('download'),
+            onclick: el.getAttribute('onclick'),
+            className: el.className,
+            id: el.id,
+            outerHTML: el.outerHTML
+        })""")
+        print('[diagnostic] TITLE LINK TEXT:', info.get('text'))
+        print('[diagnostic] TITLE LINK HREF ATTR:', info.get('hrefAttr'))
+        print('[diagnostic] TITLE LINK RESOLVED:', info.get('hrefResolved'))
+        print('[diagnostic] TITLE LINK TARGET:', info.get('target'))
+        print('[diagnostic] TITLE LINK REL:', info.get('rel'))
+        print('[diagnostic] TITLE LINK DOWNLOAD ATTR:', info.get('download'))
+        print('[diagnostic] TITLE LINK ONCLICK:', info.get('onclick'))
+        print('[diagnostic] TITLE LINK CLASS:', info.get('className'))
+        print('[diagnostic] TITLE LINK ID:', info.get('id'))
+        print('[diagnostic] TITLE LINK HTML:', clean(info.get('outerHTML'))[:1200])
+
+        observed={'download':None,'popup':None}
+
+        def on_request(req):
+            u=req.url
+            if '/download/' in u or '/sticks/' in u or 'cloudflare' in u.lower():
+                print(f'[diagnostic] REQUEST {req.method} {u}')
+
+        def on_response(resp):
+            u=resp.url
+            if '/download/' in u or '/sticks/' in u or 'cloudflare' in u.lower():
+                print(f'[diagnostic] RESPONSE {resp.status} {u}')
+
+        def on_download(download):
+            observed['download']=download
+            print(f'[diagnostic] DOWNLOAD EVENT suggested={download.suggested_filename} url={download.url}')
+
+        def on_popup(page):
+            observed['popup']=page
+            print(f'[diagnostic] POPUP EVENT url={page.url}')
+
+        self._page.on('request',on_request)
+        self._page.on('response',on_response)
+        self._page.on('download',on_download)
+        self._page.on('popup',on_popup)
+
+        before_url=self._page.url
+        before_title=self._page.title()
+        print(f'[download] clicking exact live title link text={info.get("text")!r} file={url}')
+        try:
+            target.click(timeout=int(timeout * 1000), no_wait_after=True)
+            deadline=time.time()+min(timeout,25)
+            while time.time() < deadline and observed['download'] is None:
+                self._page.wait_for_timeout(500)
+                if self._page.url != before_url:
+                    self._page.wait_for_timeout(1500)
+                    break
+
+            if observed['download'] is not None:
+                download=observed['download']
+                failure=download.failure()
+                if failure:
+                    raise RuntimeError(f'Playwright browser download failed: {failure}')
+                path=download.path()
+                if not path:
+                    raise RuntimeError('Playwright browser download completed without a readable file path')
+                data=Path(path).read_bytes()
+                return BrowserResponse(
+                    content=data,
+                    headers={
+                        'content-type':'application/octet-stream',
+                        'content-disposition':f'attachment; filename="{download.suggested_filename}"',
+                    },
+                    url=download.url or url,
+                )
+
+            after_url=self._page.url
+            after_title=self._page.title()
+            after_html=self._page.content()
+            print('[diagnostic] CLICK RESULT BEFORE URL:',before_url)
+            print('[diagnostic] CLICK RESULT BEFORE TITLE:',before_title)
+            print('[diagnostic] CLICK RESULT AFTER URL:',after_url)
+            print('[diagnostic] CLICK RESULT AFTER TITLE:',after_title)
+            print('[diagnostic] CLICK RESULT HTML LENGTH:',len(after_html))
+            if observed['popup'] is not None:
+                popup=observed['popup']
+                try:
+                    print('[diagnostic] POPUP FINAL URL:',popup.url)
+                    print('[diagnostic] POPUP TITLE:',popup.title())
+                except Exception as exc:
+                    print('[diagnostic] POPUP INSPECTION ERROR:',exc)
+            if looks_like_browser_challenge(after_title,after_html):
+                raise RuntimeError('Exact live title click reached a browser verification/challenge page')
+            raise RuntimeError(
+                f'Exact live title click produced no download event; browser ended at {after_url} title={after_title!r}'
+            )
+        finally:
+            try:self._page.remove_listener('request',on_request)
+            except Exception:pass
+            try:self._page.remove_listener('response',on_response)
+            except Exception:pass
+            try:self._page.remove_listener('download',on_download)
+            except Exception:pass
+            try:self._page.remove_listener('popup',on_popup)
+            except Exception:pass
 
     def close(self):
         try:
