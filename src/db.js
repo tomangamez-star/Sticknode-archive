@@ -38,6 +38,8 @@ async function init() {
     console.warn('[db] pg_trgm unavailable; fuzzy search will use LIKE fallback:', error.message);
   }
   await p.query(`INSERT INTO stick_archive_scraper_state(state_key) VALUES('main') ON CONFLICT(state_key) DO NOTHING`);
+  const extraMigration = path.join(__dirname, '..', 'migrations', '003_other_and_access.sql');
+  if (fs.existsSync(extraMigration)) await p.query(fs.readFileSync(extraMigration, 'utf8'));
 }
 
 async function close() {
@@ -179,10 +181,27 @@ async function stats() {
     COUNT(*) FILTER(WHERE file_type='node')::BIGINT nodes,
     COUNT(*) FILTER(WHERE file_type='movieclip')::BIGINT movieclips,
     COUNT(*) FILTER(WHERE file_type='pack')::BIGINT packs,
+    COUNT(*) FILTER(WHERE file_type='other')::BIGINT other,
     COALESCE(SUM(actual_size_bytes),0)::BIGINT bytes,
-    COUNT(DISTINCT creator)::BIGINT creators FROM stick_archive_files`);
+    COUNT(DISTINCT NULLIF(BTRIM(creator),''))::BIGINT creators,
+    COUNT(*) FILTER(WHERE NULLIF(BTRIM(creator),'') IS NULL)::BIGINT creator_missing
+    FROM stick_archive_files`);
   const failures = await query('SELECT COUNT(*)::BIGINT count FROM stick_archive_failures');
   return { ...rows[0], failures: failures.rows[0].count };
+}
+
+async function getAccessMode() {
+  const { rows } = await query(`SELECT setting_value FROM stick_archive_settings WHERE setting_key='bot_access_mode' LIMIT 1`);
+  const mode = String(rows[0] && rows[0].setting_value || 'private').toLowerCase();
+  return mode === 'public' ? 'public' : 'private';
+}
+async function setAccessMode(mode) {
+  const clean = String(mode || '').toLowerCase();
+  if (!['private','public'].includes(clean)) throw new Error('access mode must be private or public');
+  await query(`INSERT INTO stick_archive_settings(setting_key,setting_value,updated_at)
+    VALUES('bot_access_mode',$1,NOW())
+    ON CONFLICT(setting_key) DO UPDATE SET setting_value=EXCLUDED.setting_value,updated_at=NOW()`, [clean]);
+  return clean;
 }
 
 async function tryScrapeLock() {
@@ -208,4 +227,5 @@ async function releaseScrapeLock() {
 }
 
 module.exports = { init, close, query, getBySource, getByHash, getById, addAlias, saveFile, recordFailure, clearFailure, listFailures,
-  getState, updateState, browse, searchFiles, stats, tryScrapeLock, releaseScrapeLock, _trigramReady: () => trigramReady };
+  getState, updateState, browse, searchFiles, stats, getAccessMode, setAccessMode,
+  tryScrapeLock, releaseScrapeLock, _trigramReady: () => trigramReady };

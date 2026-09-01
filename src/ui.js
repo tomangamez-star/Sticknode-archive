@@ -4,28 +4,31 @@ const config = require('./config');
 const db = require('./db');
 const { htmlEscape, truncate, formatBytes } = require('./utils');
 
-const TYPE_CODE = { n: 'node', m: 'movieclip', p: 'pack' };
-const TYPE_REV = { node: 'n', movieclip: 'm', pack: 'p' };
+const TYPE_CODE = { n: 'node', m: 'movieclip', p: 'pack', o: 'other' };
+const TYPE_REV = { node: 'n', movieclip: 'm', pack: 'p', other: 'o' };
 const CAT_CODE = { all:'a', backgrounds:'bg', effects:'ef', miscellaneous:'mi', objects:'ob', people:'pe', weapons:'we', vehicles:'ve', packs:'pk' };
 const CAT_REV = Object.fromEntries(Object.entries(CAT_CODE).map(([k,v]) => [v,k]));
 const CATEGORIES = ['people','weapons','objects','vehicles','effects','backgrounds','miscellaneous'];
 const searchSessions = new Map();
 
-function typeName(type) { return ({ node:'Nodes', movieclip:'Movieclips', pack:'Packs' })[type] || type; }
+function typeName(type) { return ({ node:'Nodes', movieclip:'Movieclips', pack:'Packs', other:'Other' })[type] || type; }
 function pretty(value) { return String(value || '').replace(/(^|\s)\S/g, (m) => m.toUpperCase()); }
 function kb(rows) { return { inline_keyboard: rows }; }
-function rootMenu() {
+function rootMenu({ owner = false } = {}) {
+  const rows = [
+    [{ text:'🧍 Nodes', callback_data:'at:n' }, { text:'🎬 Movieclips', callback_data:'at:m' }],
+    [{ text:'🗜 Packs', callback_data:'at:p' }],
+  ];
+  if (owner) rows.push([{ text:'🧩 Other files', callback_data:'at:o' }]);
+  rows.push([{ text:'🔎 Search help', callback_data:'help:search' }, { text:'📊 Stats', callback_data:'stats' }]);
   return {
     text: '<b>📦 STICK NODES ARCHIVE</b>\n\nBrowse the backed-up files or search the full catalogue.',
-    keyboard: kb([
-      [{ text:'🧍 Nodes', callback_data:'at:n' }, { text:'🎬 Movieclips', callback_data:'at:m' }],
-      [{ text:'🗜 Packs', callback_data:'at:p' }],
-      [{ text:'🔎 Search help', callback_data:'help:search' }, { text:'📊 Stats', callback_data:'stats' }],
-    ]),
+    keyboard: kb(rows),
   };
 }
 function categoryMenu(type) {
   if (type === 'pack') return letterMenu(type, 'packs');
+  if (type === 'other') return letterMenu(type, 'all');
   const tc = TYPE_REV[type];
   const rows = [[{ text:'📚 All categories', callback_data:`ac:${tc}:a` }]];
   for (let i = 0; i < CATEGORIES.length; i += 2) {
