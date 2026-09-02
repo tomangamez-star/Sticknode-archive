@@ -145,6 +145,69 @@ function wire() {
     return bot.sendMessage(msg.chat.id, text, { parse_mode:'HTML' });
   });
 
+  bot.onText(/^\/archivegif(?:@\w+)?(?:\s+(on|off))?$/i, async (msg, match) => {
+    if (!ownerOnly(msg)) return;
+    const requested = String(match && match[1] || '').toLowerCase();
+    if (!requested) {
+      const enabled = String(await db.getSetting('archive_gif', 'off')).toLowerCase() === 'on';
+      const chatId = await db.getSetting('gif_archive_chat_id', '');
+      return bot.sendMessage(msg.chat.id,
+        `🎞 GIF archiving: <b>${enabled ? 'ON' : 'OFF'}</b>\n` +
+        `📂 GIF archive chat: <code>${htmlEscape(chatId || 'not set')}</code>\n\n` +
+        `Use <code>/archivegif on</code> or <code>/archivegif off</code>.`,
+        { parse_mode:'HTML' });
+    }
+    await db.setSetting('archive_gif', requested);
+    const chatId = await db.getSetting('gif_archive_chat_id', '');
+    if (requested === 'on' && !chatId) {
+      return bot.sendMessage(msg.chat.id,
+        '⚠️ GIF archiving is ON, but no GIF archive group is set yet.\n\n' +
+        'Add the bot to the preview group and send <code>/gifchat here</code> there.',
+        { parse_mode:'HTML' });
+    }
+    return bot.sendMessage(msg.chat.id,
+      `🎞 GIF archiving is now <b>${requested.toUpperCase()}</b>.`,
+      { parse_mode:'HTML' });
+  });
+
+  bot.onText(/^\/gifchat(?:@\w+)?(?:\s+(here|clear))?$/i, async (msg, match) => {
+    if (!ownerOnly(msg)) return;
+    const action = String(match && match[1] || '').toLowerCase();
+    if (!action) {
+      const chatId = await db.getSetting('gif_archive_chat_id', '');
+      return bot.sendMessage(msg.chat.id,
+        `🎞 GIF archive chat: <code>${htmlEscape(chatId || 'not set')}</code>\n\n` +
+        `Send <code>/gifchat here</code> inside the group you want to use.`,
+        { parse_mode:'HTML' });
+    }
+    if (action === 'clear') {
+      await db.setSetting('gif_archive_chat_id', '');
+      return bot.sendMessage(msg.chat.id, '🧹 GIF archive chat cleared.');
+    }
+    await db.setSetting('gif_archive_chat_id', String(msg.chat.id));
+    return bot.sendMessage(msg.chat.id,
+      `✅ This chat is now the <b>GIF preview archive</b>.\n<code>${htmlEscape(String(msg.chat.id))}</code>`,
+      { parse_mode:'HTML' });
+  });
+
+  bot.onText(/^\/superingest(?:@\w+)?(?:\s+(on|off))?$/i, async (msg, match) => {
+    if (!ownerOnly(msg)) return;
+    const requested = String(match && match[1] || '').toLowerCase();
+    if (!requested) {
+      const enabled = String(await db.getSetting('super_ingest', 'off')).toLowerCase() === 'on';
+      return bot.sendMessage(msg.chat.id,
+        `⚡ Super ingest: <b>${enabled ? 'ON' : 'OFF'}</b>\n\n` +
+        `Use <code>/superingest on</code> or <code>/superingest off</code>.\n` +
+        `The setting is read when the next GitHub ingest run starts.`,
+        { parse_mode:'HTML' });
+    }
+    await db.setSetting('super_ingest', requested);
+    return bot.sendMessage(msg.chat.id,
+      `⚡ Super ingest is now <b>${requested.toUpperCase()}</b>.\n` +
+      `It will apply to the next GitHub ingest run.`,
+      { parse_mode:'HTML' });
+  });
+
   bot.onText(/^\/access(?:@\w+)?(?:\s+(private|public))?$/i, async (msg, match) => {
     if (!ownerOnly(msg)) return;
     const requested = String(match && match[1] || '').toLowerCase();
@@ -238,6 +301,16 @@ function wire() {
         if (!file) return bot.sendMessage(query.message.chat.id, '❌ Archived file not found.');
         if (file.file_type === 'other' && !ownerUser(query.from)) {
           return bot.sendMessage(query.message.chat.id, '🔒 Other files are owner-only.');
+        }
+        if (file.preview_telegram_file_id) {
+          try {
+            await bot.sendAnimation(query.message.chat.id, file.preview_telegram_file_id, {
+              caption:`🎞 <b>Preview — ${htmlEscape(file.title)}</b>`,
+              parse_mode:'HTML',
+            });
+          } catch (previewError) {
+            console.warn('[telegram] preview send failed:', previewError.message);
+          }
         }
         return bot.sendDocument(query.message.chat.id, file.telegram_file_id, {
           caption: ui.fileCaption(file), parse_mode:'HTML', disable_content_type_detection:false,

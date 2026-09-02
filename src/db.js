@@ -190,6 +190,25 @@ async function stats() {
   return { ...rows[0], failures: failures.rows[0].count };
 }
 
+async function getSetting(key, fallback = '') {
+  const { rows } = await query(
+    `SELECT setting_value FROM stick_archive_settings WHERE setting_key=$1 LIMIT 1`,
+    [String(key)]
+  );
+  return rows[0] ? String(rows[0].setting_value ?? '') : String(fallback);
+}
+async function setSetting(key, value) {
+  const cleanKey = String(key || '').trim();
+  if (!cleanKey) throw new Error('setting key is required');
+  const cleanValue = String(value ?? '');
+  await query(`INSERT INTO stick_archive_settings(setting_key,setting_value,updated_at)
+    VALUES($1,$2,NOW())
+    ON CONFLICT(setting_key) DO UPDATE
+    SET setting_value=EXCLUDED.setting_value,updated_at=NOW()`,
+    [cleanKey, cleanValue]);
+  return cleanValue;
+}
+
 async function getAccessMode() {
   const { rows } = await query(`SELECT setting_value FROM stick_archive_settings WHERE setting_key='bot_access_mode' LIMIT 1`);
   const mode = String(rows[0] && rows[0].setting_value || 'private').toLowerCase();
@@ -227,5 +246,5 @@ async function releaseScrapeLock() {
 }
 
 module.exports = { init, close, query, getBySource, getByHash, getById, addAlias, saveFile, recordFailure, clearFailure, listFailures,
-  getState, updateState, browse, searchFiles, stats, getAccessMode, setAccessMode,
+  getState, updateState, browse, searchFiles, stats, getSetting, setSetting, getAccessMode, setAccessMode,
   tryScrapeLock, releaseScrapeLock, _trigramReady: () => trigramReady };
