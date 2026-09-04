@@ -1,0 +1,209 @@
+name: StickNodes authenticated cookie ingest
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: What should GitHub ingest?
+        required: true
+        default: backfill
+        type: choice
+        options: [backfill, recent, both]
+      backfill_pages:
+        description: Historical pages to process this run
+        required: true
+        default: '1'
+        type: string
+      recent_pages:
+        description: Newest pages to re-check
+        required: true
+        default: '1'
+        type: string
+      start_page:
+        description: Optional backfill cursor override (0 = resume)
+        required: true
+        default: '0'
+        type: string
+      auth_test_only:
+        description: Test cookies only; do not ingest anything
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sticknodes-auth-cookie-ingest
+  cancel-in-progress: false
+
+jobs:
+  authenticated-ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      ARCHIVE_CHAT_ID: ${{ secrets.ARCHIVE_CHAT_ID }}
+      OWNER_ID: ${{ secrets.OWNER_ID }}
+      INGEST_NOTIFICATION_CHAT_ID: ${{ secrets.INGEST_NOTIFICATION_CHAT_ID }}
+      STICKNODES_BASE_URL: https://sticknodes.com
+      STICKNODES_LIST_URL: https://sticknodes.com/stickfigures/
+      STICKNODES_COOKIES_FILE: /tmp/sticknodes-cookies.txt
+      SCRAPER_SITE_DELAY_MS: '350'
+      SCRAPER_UPLOAD_DELAY_MS: '650'
+      SCRAPER_MAX_FILE_MB: '45'
+      SCRAPER_FETCH_DETAILS: 'false'
+      SCRAPER_PROVIDER_RETRIES: '1'
+      SCRAPER_PROVIDER_RETRY_DELAY_SECONDS: '3'
+      INGEST_FETCH_PROVIDER: retriever
+      RETRIEVER_PROVIDER: direct
+      RETRIEVER_ALLOWED_HOSTS: sticknodes.com
+      RETRIEVER_RESPECT_ROBOTS: 'true'
+      RETRIEVER_TIMEOUT_SECONDS: '60'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        if: ${{ !inputs.auth_test_only }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install Python dependencies
+        if: ${{ !inputs.auth_test_only }}
+        run: pip install -r requirements.txt
+
+      - name: Create temporary StickNodes cookie jar
+        shell: bash
+        env:
+          STICKNODES_COOKIES: ${{ secrets.STICKNODES_COOKIES }}
+        run: |
+          set -euo pipefail
+          if [ -z "${STICKNODES_COOKIES:-}" ]; then
+            echo "::error::Missing GitHub Actions secret STICKNODES_COOKIES"
+            exit 1
+          fi
+          umask 077
+          printf '%s' "$STICKNODES_COOKIES" > "$STICKNODES_COOKIES_FILE"
+          if [ ! -s "$STICKNODES_COOKIES_FILE" ]; then
+            echo "::error::Cookie file was created but is empty"
+            exit 1
+          fi
+          echo "Cookie jar created securely."
+          echo "Cookie lines: $(wc -l < "$STICKNODES_COOKIES_FILE" | tr -d ' ')"
+
+      - name: Show direct GitHub runner IP
+        run: |
+          echo "Direct GitHub runner public IP:"
+          curl -fsS --max-time 20 https://api.ipify.org
+          echo
+
+      - name: Test authenticated StickNodes listing
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL="https://sticknodes.com/stickfigures/?wpfb_list_page=1"
+          BODY="/tmp/sticknodes-auth-listing.html"
+          HEADERS="/tmp/sticknodes-auth-listing.headers"
+          HTTP_CODE="$(curl -L --max-time 60 --connect-timeout 20 \
+            --cookie "$STICKNODES_COOKIES_FILE" \
+            --cookie-jar "$STICKNODES_COOKIES_FILE" \
+            -D "$HEADERS" -o "$BODY" -sS -w '%{http_code}' "$URL")"
+          BYTES="$(wc -c < "$BODY" | tr -d ' ')"
+          echo "Listing HTTP status: $HTTP_CODE"
+          echo "Listing bytes: $BYTES"
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "::error::Authenticated listing request did not return HTTP 200"
+            exit 1
+          fi
+          if [ "$BYTES" -lt 5000 ]; then
+            echo "::error::Listing response is unexpectedly small"
+            exit 1
+          fi
+          if grep -Eqi 'Just a moment|challenges\.cloudflare\.com|verify you are human|cf-browser-verification' "$BODY"; then
+            echo "::error::Listing response still looks like a verification/challenge page"
+            exit 1
+          fi
+          if ! grep -qi '/download/' "$BODY"; then
+            echo "::error::HTTP 200 received, but no StickNodes download links were found"
+            exit 1
+          fi
+          echo "SUCCESS: authenticated listing page is usable from GitHub direct."
+
+      - name: Test one authenticated StickNodes file
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL="https://sticknodes.com/download/people/Lynn-Loud-Dad-Lincoln-Loud.nodes"
+          FILE="/tmp/sticknodes-auth-test.nodes"
+          HTTP_CODE="$(curl -L --max-time 60 --connect-timeout 20 \
+            --cookie "$STICKNODES_COOKIES_FILE" \
+            --cookie-jar "$STICKNODES_COOKIES_FILE" \
+            -o "$FILE" -sS -w '%{http_code}' "$URL")"
+          BYTES="$(wc -c < "$FILE" | tr -d ' ')"
+          echo "File HTTP status: $HTTP_CODE"
+          echo "Downloaded bytes: $BYTES"
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "::error::Authenticated file request did not return HTTP 200"
+            exit 1
+          fi
+          if [ "$BYTES" != "44635" ]; then
+            echo "::error::Expected 44635 bytes but received $BYTES"
+            exit 1
+          fi
+          echo "SUCCESS: GitHub direct + StickNodes cookies downloaded the known real file."
+
+      - name: Register authenticated archive run telemetry
+        if: ${{ !inputs.auth_test_only }}
+        shell: bash
+        env:
+          RUN_MODE: ${{ inputs.mode }}
+          BACKFILL_PAGES: ${{ inputs.backfill_pages }}
+          RECENT_PAGES: ${{ inputs.recent_pages }}
+        run: |
+          python - <<'PY'
+          import os
+          import psycopg
+          mode = os.environ['RUN_MODE']
+          backfill = max(0, int(os.environ['BACKFILL_PAGES']))
+          recent = max(0, int(os.environ['RECENT_PAGES']))
+          target = backfill if mode == 'backfill' else recent if mode == 'recent' else backfill + recent
+          run_id = f"gh-auth:{os.environ.get('GITHUB_RUN_ID','unknown')}:{mode}:{target}"
+          db = os.environ['DATABASE_URL'].strip()
+          sslmode = 'prefer' if ('localhost' in db or '127.0.0.1' in db) else 'require'
+          with psycopg.connect(db, sslmode=sslmode) as conn:
+              with conn.cursor() as cur:
+                  cur.execute("""
+                      UPDATE stick_archive_scraper_state
+                      SET run_id=%s,status='preparing',current_page=0,pages_completed_latest=0,
+                          archived_latest=0,skipped_latest=0,failed_latest=0,last_error='',
+                          heartbeat_at=NOW(),run_finished_at=NULL,updated_at=NOW()
+                      WHERE state_key='main'
+                  """, (run_id,))
+              conn.commit()
+          print(f'[telemetry] registered {run_id}')
+          PY
+
+      - name: Run authenticated direct ingestion
+        if: ${{ !inputs.auth_test_only }}
+        run: |
+          echo "Starting StickNodes ingest directly from GitHub with authenticated cookies..."
+          python python_ingest/cookie_ingest.py \
+            --mode=${{ inputs.mode }} \
+            --backfill-pages=${{ inputs.backfill_pages }} \
+            --recent-pages=${{ inputs.recent_pages }} \
+            --start-page=${{ inputs.start_page }}
+
+      - name: Remove temporary authentication files
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          rm -f "$STICKNODES_COOKIES_FILE" \
+            /tmp/sticknodes-auth-listing.html \
+            /tmp/sticknodes-auth-listing.headers \
+            /tmp/sticknodes-auth-test.nodes
+          echo "Temporary StickNodes authentication/test files removed."
